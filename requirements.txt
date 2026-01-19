@@ -1,0 +1,5 @@
+streamlit==1.53.0
+requests
+numpy
+pandas
+supabase==2.6.0

@@ -1,0 +1,681 @@
+import time
+import random
+import sqlite3
+import requests
+import numpy as np
+import pandas as pd
+import streamlit as st
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, List, Optional
+
+HL_INFO_URL = "https://api.hyperliquid.xyz/info"
+
+# =========================
+# STRATEGY CONFIG
+# =========================
+INTERVAL = "15m"
+
+DROP_MIN = 0.005
+DROP_MAX = 0.05
+VOL_Z_MAX_DEFAULT = 0.6
+
+VOL_WIN = 20
+VOL_SPIKE_MULT_DEFAULT = 2.0
+VOL_FLOOR_MULT_DEFAULT = 1.2
+
+TP = 0.015
+SL = 0.020
+HOLD_BARS = 24
+
+FEE_PER_SIDE = 0.00045
+SLIP_PER_SIDE = 0.00030
+
+REFRESH_SECONDS = 60
+MAX_CALLS_DISPLAY = 20
+
+SWEETSPOT_PATH = "sweetspot_coins.csv"
+DB_PATH = "calls.db"
+
+# =========================
+# PAGE / STYLE (HIGH CONTRAST)
+# =========================
+st.set_page_config(page_title="HL Whale-Dump Bounce Scanner", layout="wide")
+
+CUSTOM_CSS = """
+<style>
+:root { color-scheme: dark; }
+html, body, [data-testid="stApp"] { background: #05070c !important; }
+
+/* Main container */
+.block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1400px; }
+h1, h2, h3, h4, p, div, span, label { color: #F1F5F9 !important; }
+.small { font-size: 12px; opacity: 0.92; }
+
+/* Sidebar */
+section[data-testid="stSidebar"] { background: #070B12 !important; border-right: 1px solid rgba(255,255,255,0.10); }
+section[data-testid="stSidebar"] * { color: #F1F5F9 !important; opacity: 1 !important; }
+section[data-testid="stSidebar"] label { color: #F1F5F9 !important; }
+
+/* Cards */
+.card {
+  background: linear-gradient(180deg, #0B1220 0%, #070B12 100%);
+  border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 18px;
+  padding: 16px 18px;
+  box-shadow: 0 14px 30px rgba(0,0,0,0.50);
+}
+.pill {
+  display:inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.14);
+  background: rgba(255,255,255,0.04);
+  margin-right: 6px;
+  font-size: 12px;
+}
+
+/* Utility colors */
+.good { color: #7CFF9B !important; }
+.bad { color: #FF6B6B !important; }
+.neutral { color: #9DB2FF !important; }
+
+hr { border-color: rgba(255,255,255,0.10); }
+
+/* Dataframe */
+div[data-testid="stDataFrame"] {
+  border-radius: 16px;
+  border: 1px solid rgba(255,255,255,0.10);
+  overflow: hidden;
+}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# =========================
+# RERUN helper (Streamlit 1.53)
+# =========================
+def safe_rerun():
+    if hasattr(st, "rerun"):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
+    else:
+        st.stop()
+
+# =========================
+# SQLite persistence
+# =========================
+def db_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+def db_init():
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS calls (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      call_time TEXT NOT NULL,
+      coin TEXT NOT NULL,
+      call_price REAL NOT NULL,
+      tp_price REAL NOT NULL,
+      sl_price REAL NOT NULL,
+      expiry_time TEXT NOT NULL,
+      dump_pct REAL NOT NULL,
+      vol_z REAL NOT NULL,
+      vol_ratio REAL NOT NULL,
+      liq_ratio REAL NOT NULL,
+      chance_pct REAL NOT NULL,
+      status TEXT NOT NULL,
+      last_price REAL NOT NULL,
+      pnl_pct REAL NOT NULL,
+      UNIQUE(coin, call_time)
+    );
+    """)
+    con.commit()
+    con.close()
+
+def db_insert_calls(rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    con = db_conn()
+    cur = con.cursor()
+    n = 0
+    for r in rows:
+        try:
+            cur.execute("""
+            INSERT OR IGNORE INTO calls
+            (call_time, coin, call_price, tp_price, sl_price, expiry_time,
+             dump_pct, vol_z, vol_ratio, liq_ratio, chance_pct,
+             status, last_price, pnl_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                r["call_time"].isoformat(),
+                r["coin"],
+                float(r["call_price"]),
+                float(r["tp_price"]),
+                float(r["sl_price"]),
+                r["expiry_time"].isoformat(),
+                float(r["dump_pct"]),
+                float(r["vol_z"]),
+                float(r["vol_ratio"]),
+                float(r["liq_ratio"]),
+                float(r["chance_pct"]),
+                r["status"],
+                float(r["last_price"]),
+                float(r["pnl_pct"]),
+            ))
+            if cur.rowcount == 1:
+                n += 1
+        except Exception:
+            pass
+    con.commit()
+    con.close()
+    return n
+
+def db_read_calls(limit: int = 5000) -> pd.DataFrame:
+    con = db_conn()
+    df = pd.read_sql_query(
+        f"SELECT * FROM calls ORDER BY call_time DESC LIMIT {int(limit)}",
+        con
+    )
+    con.close()
+    if df.empty:
+        return df
+    df["call_time"] = pd.to_datetime(df["call_time"], utc=True)
+    df["expiry_time"] = pd.to_datetime(df["expiry_time"], utc=True)
+    return df
+
+def db_update_call(coin: str, call_time: pd.Timestamp, status: str, last_price: float, pnl_pct: float):
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("""
+    UPDATE calls
+    SET status = ?, last_price = ?, pnl_pct = ?
+    WHERE coin = ? AND call_time = ?
+    """, (status, float(last_price), float(pnl_pct), coin, call_time.isoformat()))
+    con.commit()
+    con.close()
+
+# =========================
+# HL Client (rate limited)
+# =========================
+SESSION = requests.Session()
+_last_call_ts = 0.0
+REQUEST_MIN_DELAY = 0.20
+MAX_RETRIES = 8
+
+def hl_post(payload: Dict[str, Any]) -> Any:
+    global _last_call_ts
+    now = time.time()
+    wait = REQUEST_MIN_DELAY - (now - _last_call_ts)
+    if wait > 0:
+        time.sleep(wait)
+
+    backoff = 0.6
+    for _ in range(MAX_RETRIES):
+        try:
+            r = SESSION.post(HL_INFO_URL, json=payload, timeout=20)
+
+            if r.status_code == 429:
+                time.sleep(backoff + random.uniform(0, 0.4))
+                backoff = min(backoff * 1.7, 10.0)
+                continue
+
+            if r.status_code in (500, 502, 503, 504):
+                time.sleep(backoff + random.uniform(0, 0.4))
+                backoff = min(backoff * 1.7, 10.0)
+                continue
+
+            r.raise_for_status()
+            _last_call_ts = time.time()
+            return r.json()
+
+        except requests.RequestException:
+            time.sleep(backoff + random.uniform(0, 0.4))
+            backoff = min(backoff * 1.7, 10.0)
+
+    raise RuntimeError("HL request failed after retries")
+
+def to_ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+def fetch_candles(coin: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    data = hl_post({
+        "type": "candleSnapshot",
+        "req": {"coin": coin, "interval": INTERVAL, "startTime": start_ms, "endTime": end_ms}
+    })
+    if not data:
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+
+    df = pd.DataFrame(data)
+    if "t" not in df.columns:
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+
+    df["timestamp"] = pd.to_datetime(df["t"], unit="ms", utc=True)
+    for src, dst in [("o","open"),("h","high"),("l","low"),("c","close"),("v","volume")]:
+        df[dst] = pd.to_numeric(df.get(src), errors="coerce")
+
+    df = df[["timestamp","open","high","low","close","volume"]].dropna()
+    df = df.sort_values("timestamp").drop_duplicates("timestamp")
+    return df
+
+@st.cache_data(show_spinner=False)
+def load_sweetspot() -> pd.DataFrame:
+    df = pd.read_csv(SWEETSPOT_PATH)
+    df["coin"] = df["coin"].astype(str)
+    if "winrate" not in df.columns:
+        df["winrate"] = 0.55
+    return df
+
+def human_age(dt: pd.Timestamp) -> str:
+    delta = datetime.now(timezone.utc) - dt.to_pydatetime()
+    sec = int(delta.total_seconds())
+    if sec < 60: return f"{sec}s"
+    mins = sec // 60
+    if mins < 60: return f"{mins}m"
+    hrs = mins // 60
+    if hrs < 48: return f"{hrs}h"
+    days = hrs // 24
+    return f"{days}d"
+
+def compute_chance_pct(base_wr: float, dump_pct: float, vol_z: float, vol_ratio: float, liq_ratio: float,
+                       vol_z_max: float, vol_spike_mult: float, vol_floor_mult: float) -> float:
+    wr = float(np.clip(base_wr, 0.35, 0.80))
+    score = (wr - 0.50)
+
+    dump_norm = np.clip((dump_pct - DROP_MIN) / (DROP_MAX - DROP_MIN), 0, 1)
+    score += 0.12 * dump_norm
+
+    vol_norm = np.clip((vol_ratio - vol_spike_mult) / max(0.1, (4.0 - vol_spike_mult)), 0, 1)
+    score += 0.10 * vol_norm
+
+    z_norm = np.clip(abs(vol_z) / max(0.01, vol_z_max), 0, 1)
+    score -= 0.10 * z_norm
+
+    liq_norm = np.clip((liq_ratio - vol_floor_mult) / max(0.1, (2.0 - vol_floor_mult)), 0, 1)
+    score += 0.04 * liq_norm
+
+    chance = 50 + score * 100
+    return float(np.clip(chance, 5, 95))
+
+def build_macro_series(end: datetime) -> pd.DataFrame:
+    start = end - timedelta(days=3)
+    btc = fetch_candles("BTC", to_ms(start), to_ms(end))
+    if btc.empty or len(btc) < 120:
+        return pd.DataFrame(columns=["timestamp","vol_z"])
+
+    ret = np.log(btc["close"]).diff()
+    rv = ret.rolling(40).std(ddof=0)
+    mu = rv.rolling(40).mean()
+    sd = rv.rolling(40).std(ddof=0)
+    vol_z = (rv - mu) / sd
+    out = pd.DataFrame({"timestamp": btc["timestamp"], "vol_z": vol_z}).dropna()
+    return out
+
+def detect_call_for_coin(coin: str, macro: pd.DataFrame, base_wr: float, end: datetime,
+                         vol_z_max: float, vol_spike_mult: float, vol_floor_mult: float) -> Optional[Dict[str, Any]]:
+    start = end - timedelta(days=3)
+    df = fetch_candles(coin, to_ms(start), to_ms(end))
+    if df.empty or len(df) < (VOL_WIN + 5):
+        return None
+
+    m = pd.merge(df, macro, on="timestamp", how="inner").dropna()
+    if m.empty or len(m) < (VOL_WIN + 5):
+        return None
+
+    m = m.reset_index(drop=True)
+    last = m.iloc[-1]
+
+    dump_pct = float((last["open"] - last["low"]) / last["open"])
+    vol_z = float(last["vol_z"])
+
+    medv = m["volume"].rolling(VOL_WIN).median().iloc[-1]
+    if not np.isfinite(medv) or medv <= 0:
+        return None
+
+    vol_ratio = float(last["volume"] / medv)
+    liq_ratio = float(last["volume"] / medv)
+
+    dump_ok = (dump_pct >= DROP_MIN) and (dump_pct <= DROP_MAX)
+    macro_ok = (abs(vol_z) <= vol_z_max)
+    spike_ok = (vol_ratio >= vol_spike_mult)
+    floor_ok = (liq_ratio >= vol_floor_mult)
+
+    if not (dump_ok and macro_ok and spike_ok and floor_ok):
+        return None
+
+    call_price = float(last["close"])
+    call_time = pd.to_datetime(last["timestamp"], utc=True)
+    tp_price = call_price * (1 + TP)
+    sl_price = call_price * (1 - SL)
+    expiry_time = call_time + timedelta(minutes=15 * HOLD_BARS)
+
+    chance_pct = compute_chance_pct(
+        base_wr=base_wr,
+        dump_pct=dump_pct,
+        vol_z=vol_z,
+        vol_ratio=vol_ratio,
+        liq_ratio=liq_ratio,
+        vol_z_max=vol_z_max,
+        vol_spike_mult=vol_spike_mult,
+        vol_floor_mult=vol_floor_mult
+    )
+
+    return {
+        "call_time": call_time,
+        "coin": coin,
+        "call_price": call_price,
+        "tp_price": tp_price,
+        "sl_price": sl_price,
+        "expiry_time": expiry_time,
+        "dump_pct": dump_pct * 100.0,
+        "vol_z": vol_z,
+        "vol_ratio": vol_ratio,
+        "liq_ratio": liq_ratio,
+        "chance_pct": chance_pct,
+        "status": "OPEN",
+        "last_price": call_price,
+        "pnl_pct": 0.0,
+    }
+
+def update_call_status(call_row: pd.Series, end: datetime) -> Dict[str, Any]:
+    coin = str(call_row["coin"])
+    call_time = pd.to_datetime(call_row["call_time"], utc=True)
+    start = call_time - timedelta(minutes=15)
+
+    df = fetch_candles(coin, to_ms(start.to_pydatetime()), to_ms(end))
+    if df.empty:
+        return dict(call_row)
+
+    df = df[df["timestamp"] >= call_time].copy()
+    if df.empty:
+        return dict(call_row)
+
+    tp_price = float(call_row["tp_price"])
+    sl_price = float(call_row["sl_price"])
+    call_price = float(call_row["call_price"])
+    expiry_time = pd.to_datetime(call_row["expiry_time"], utc=True)
+
+    hit_tp = (df["high"] >= tp_price).any()
+    hit_sl = (df["low"] <= sl_price).any()
+
+    status = "OPEN"
+    if hit_sl:
+        status = "SL"
+    elif hit_tp:
+        status = "TP"
+    elif datetime.now(timezone.utc) >= expiry_time.to_pydatetime():
+        status = "EXPIRED"
+
+    last_price = float(df["close"].iloc[-1])
+    pnl_pct = (last_price / call_price - 1.0) * 100.0
+
+    updated = dict(call_row)
+    updated["status"] = status
+    updated["last_price"] = last_price
+    updated["pnl_pct"] = pnl_pct
+    return updated
+
+def simulate_pnl(calls: pd.DataFrame, start_equity: float, notional_per_trade: float, apply_friction: bool) -> Dict[str, Any]:
+    if calls.empty:
+        return {"equity": start_equity, "pnl": 0.0, "pnl_pct": 0.0, "open_count": 0, "closed_count": 0}
+
+    df = calls.copy()
+    df["call_time"] = pd.to_datetime(df["call_time"], utc=True)
+    df = df.sort_values("call_time")
+
+    friction_rt = 0.0
+    if apply_friction:
+        friction_rt = 2.0 * (FEE_PER_SIDE + SLIP_PER_SIDE)
+
+    equity = start_equity
+    closed = 0
+    open_ = 0
+
+    for _, r in df.iterrows():
+        entry = float(r["call_price"])
+        lastp = float(r["last_price"])
+        status = str(r["status"])
+
+        if status == "TP":
+            exitp = float(r["tp_price"])
+            closed += 1
+        elif status == "SL":
+            exitp = float(r["sl_price"])
+            closed += 1
+        elif status == "EXPIRED":
+            exitp = lastp
+            closed += 1
+        else:
+            exitp = lastp
+            open_ += 1
+
+        ret = (exitp / entry) - 1.0
+        ret -= friction_rt
+
+        pnl_dollars = notional_per_trade * ret
+        equity += pnl_dollars
+
+    pnl = equity - start_equity
+    return {
+        "equity": equity,
+        "pnl": pnl,
+        "pnl_pct": (pnl / start_equity) * 100.0,
+        "open_count": open_,
+        "closed_count": closed
+    }
+
+# =========================
+# APP START
+# =========================
+db_init()
+
+st.markdown(
+    """
+    <div class="card">
+      <h1 style="margin:0;">HL Whale-Dump Bounce Scanner</h1>
+      <div class="small">
+        Signals only: dump 0.5–5% + BTC vol_z calm + volume spike. Calls are persisted to SQLite.
+      </div>
+      <div style="margin-top:10px;">
+        <span class="pill">TP +1.5%</span>
+        <span class="pill">SL -2.0%</span>
+        <span class="pill">Hold 6h</span>
+        <span class="pill">24/7</span>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+# Sidebar
+with st.sidebar:
+    st.markdown("### Scanner")
+    refresh = st.toggle("Auto-refresh", value=True)
+    st.caption("Candles update every 15m. Refreshing every 60s is fine.")
+
+    st.markdown("### Live gates")
+    vol_z_max = st.slider("BTC vol_z max", 0.2, 1.5, float(VOL_Z_MAX_DEFAULT), 0.1)
+    vol_spike_mult = st.slider("Volume spike mult", 1.2, 4.0, float(VOL_SPIKE_MULT_DEFAULT), 0.1)
+    vol_floor_mult = st.slider("Liquidity floor mult", 1.0, 2.0, float(VOL_FLOOR_MULT_DEFAULT), 0.05)
+
+    st.markdown("### Universe")
+    max_coins_ui = st.number_input("Max coins to scan", min_value=10, max_value=400, value=120, step=10)
+
+    st.markdown("### PnL since start")
+    start_equity = st.number_input("Start equity ($)", min_value=1_000, max_value=10_000_000, value=100_000, step=1_000)
+    notional_per_trade = st.number_input("Notional per trade ($)", min_value=100, max_value=100_000, value=2_000, step=100)
+    apply_friction = st.toggle("Apply fees+slippage", value=True)
+
+    st.markdown("### Data")
+    if st.button("Export calls CSV"):
+        calls_df = db_read_calls(limit=200000)
+        if calls_df.empty:
+            st.warning("No calls to export yet.")
+        else:
+            csv = calls_df.sort_values("call_time").to_csv(index=False).encode("utf-8")
+            st.download_button("Download calls.csv", data=csv, file_name="calls_export.csv", mime="text/csv")
+
+# ---- Load universe (and show helpful errors) ----
+try:
+    sweet = load_sweetspot().head(int(max_coins_ui)).reset_index(drop=True)
+except Exception as e:
+    st.error(f"Could not load {SWEETSPOT_PATH}. Make sure it exists next to app.py. Error: {e}")
+    st.stop()
+
+now = datetime.now(timezone.utc)
+
+# Main layout
+colA, colB = st.columns([1.15, 1])
+
+with colA:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("Live scan")
+    st.caption("We only display calls. Scanning runs each refresh.")
+
+    inserted = 0
+    with st.spinner("Building BTC macro + scanning sweetspot universe…"):
+        macro = build_macro_series(now)
+
+        if macro.empty:
+            st.error("BTC macro series is empty. HL may be rate-limiting or returned no BTC candles.")
+            st.caption("Tip: wait 1–2 mins and refresh. Or reduce max coins temporarily.")
+        else:
+            new_calls = []
+            scanned = 0
+            for _, row in sweet.iterrows():
+                coin = str(row["coin"])
+                base_wr = float(row.get("winrate", 0.55))
+                scanned += 1
+                try:
+                    c = detect_call_for_coin(
+                        coin=coin, macro=macro, base_wr=base_wr, end=now,
+                        vol_z_max=vol_z_max, vol_spike_mult=vol_spike_mult, vol_floor_mult=vol_floor_mult
+                    )
+                    if c:
+                        new_calls.append(c)
+                except Exception:
+                    pass
+
+            inserted = db_insert_calls(new_calls)
+            st.markdown(
+                f"<div class='small neutral'>Scanned: <b>{scanned}</b> coins | New calls inserted: <b>{inserted}</b></div>",
+                unsafe_allow_html=True
+            )
+
+    # Update statuses for recent calls
+    calls = db_read_calls(limit=2000)
+    if not calls.empty:
+        recent = calls.sort_values("call_time", ascending=False).head(50).copy()
+        updated_n = 0
+        for _, r in recent.iterrows():
+            try:
+                upd = update_call_status(r, now)
+                if (upd["status"] != r["status"]) or (abs(float(upd["pnl_pct"]) - float(r["pnl_pct"])) > 0.01):
+                    db_update_call(
+                        str(r["coin"]),
+                        pd.to_datetime(r["call_time"], utc=True),
+                        upd["status"],
+                        float(upd["last_price"]),
+                        float(upd["pnl_pct"])
+                    )
+                    updated_n += 1
+            except Exception:
+                pass
+        st.markdown(f"<div class='small'>Status updates this refresh: <b>{updated_n}</b></div>", unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with colB:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("PnL since start")
+
+    calls = db_read_calls(limit=200000)
+    sim = simulate_pnl(
+        calls=calls,
+        start_equity=float(start_equity),
+        notional_per_trade=float(notional_per_trade),
+        apply_friction=bool(apply_friction)
+    )
+
+    pnl = sim["pnl"]
+    pnl_pct = sim["pnl_pct"]
+    eq = sim["equity"]
+
+    pnl_color = "good" if pnl >= 0 else "bad"
+    st.markdown(
+        f"""
+        <div style="display:flex; gap:18px; flex-wrap:wrap;">
+          <div>
+            <div class="small">Equity</div>
+            <div style="font-size:28px;" class="{pnl_color}">${eq:,.0f}</div>
+          </div>
+          <div>
+            <div class="small">PnL</div>
+            <div style="font-size:28px;" class="{pnl_color}">${pnl:,.0f}</div>
+          </div>
+          <div>
+            <div class="small">PnL %</div>
+            <div style="font-size:28px;" class="{pnl_color}">{pnl_pct:+.2f}%</div>
+          </div>
+        </div>
+        <div class="small" style="margin-top:10px;">
+          Trades simulated: closed <b>{sim["closed_count"]}</b>, open <b>{sim["open_count"]}</b>.
+          Model: fixed notional per trade.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# Recent calls table
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+st.subheader("Recent calls (last 20)")
+
+calls = db_read_calls(limit=5000)
+if calls.empty:
+    st.info("No calls yet. This is normal if filters are strict. Try raising vol_z_max or lowering volume spike mult.")
+else:
+    view = calls.sort_values("call_time", ascending=False).head(MAX_CALLS_DISPLAY).copy()
+    view["Since"] = view["call_time"].apply(human_age)
+
+    def status_tag(s: str) -> str:
+        s = str(s)
+        if s == "TP": return "TP ✅"
+        if s == "SL": return "SL ❌"
+        if s == "EXPIRED": return "EXPIRED ⏳"
+        return "OPEN •"
+
+    view["Status"] = view["status"].apply(status_tag)
+    view["Chance"] = view["chance_pct"].map(lambda x: f"{float(x):.0f}%")
+    view["Call px"] = view["call_price"].map(lambda x: f"{float(x):.6g}")
+    view["Now px"] = view["last_price"].map(lambda x: f"{float(x):.6g}")
+    view["Change %"] = view["pnl_pct"].map(lambda x: f"{float(x):+.2f}%")
+    view["Dump %"] = view["dump_pct"].map(lambda x: f"{float(x):.2f}%")
+    view["BTC vol_z"] = view["vol_z"].map(lambda x: f"{float(x):+.2f}")
+    view["Vol spike x"] = view["vol_ratio"].map(lambda x: f"{float(x):.2f}x")
+
+    out = view[["call_time","Since","coin","Status","Chance","Call px","Now px","Change %","Dump %","BTC vol_z","Vol spike x"]].copy()
+    out.rename(columns={"call_time":"Call time (UTC)","coin":"Coin"}, inplace=True)
+    st.dataframe(out, use_container_width=True, height=520)
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+st.markdown(
+    "<div class='small'>"
+    "<b>Note:</b> SQLite persistence is solid locally. On Streamlit Cloud, file persistence can vary across redeploys. "
+    "If you want guaranteed durability, we can switch storage to Supabase."
+    "</div>",
+    unsafe_allow_html=True
+)
+
+# =========================
+# Auto-refresh (IMPORTANT: must run LAST)
+# =========================
+if refresh:
+    st.markdown(
+        f"<div class='small neutral'>Auto-refresh enabled. Next refresh in ~{REFRESH_SECONDS}s.</div>",
+        unsafe_allow_html=True
+    )
+    time.sleep(REFRESH_SECONDS)
+    safe_rerun()
