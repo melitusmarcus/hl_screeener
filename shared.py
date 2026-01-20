@@ -1,3 +1,4 @@
+import os
 import time
 import random
 import requests
@@ -13,7 +14,7 @@ HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 # =========================
 # CONFIG (shared)
 # =========================
-INTERVAL = "15m"
+INTERVAL = "15m"  # HL candle interval
 
 DROP_MIN = 0.005
 DROP_MAX = 0.05
@@ -33,18 +34,13 @@ SLIP_PER_SIDE = 0.00030
 SWEETSPOT_PATH = "sweetspot_coins.csv"
 
 # =========================
-# Supabase (worker + UI)
+# Supabase (ENV only)
 # =========================
-def get_supabase_client_from_env() -> Client:
-    """
-    For worker (recommended): use env vars.
-    For UI (Streamlit): we'll pass secrets in app.py (see below).
-    """
-    import os
+def supabase_client_env() -> Client:
     url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    key = os.getenv("SUPABASE_SERVICE_KEY")
     if not url or not key:
-        raise RuntimeError("Missing SUPABASE_URL and SUPABASE_SERVICE_KEY (env vars).")
+        raise RuntimeError("Missing SUPABASE_URL / SUPABASE_SERVICE_KEY env vars.")
     return create_client(url, key)
 
 def db_upsert_calls(sb: Client, rows: List[Dict[str, Any]]) -> int:
@@ -80,6 +76,7 @@ def db_read_calls(sb: Client, limit: int = 5000) -> pd.DataFrame:
     df = pd.DataFrame(data)
     if df.empty:
         return df
+
     df["call_time"] = pd.to_datetime(df["call_time"], utc=True, errors="coerce")
     df["expiry_time"] = pd.to_datetime(df["expiry_time"], utc=True, errors="coerce")
     if "detected_time" in df.columns:
