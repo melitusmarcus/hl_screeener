@@ -4,3 +4,4 @@ numpy
 pandas
 supabase
 python-dotenv
+scikit-learn==1.5.1
