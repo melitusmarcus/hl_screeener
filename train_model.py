@@ -38,7 +38,7 @@ def main():
         print("No data. Exiting.")
         return
 
-    # Vi tr‰nar bara pÂ st‰ngda trades (TP/SL). EXPIRED kan du ta med senare.
+    # Vi tr√§nar bara p√• st√§ngda trades (TP/SL). EXPIRED kan du ta med senare.
     df = df[df["status"].isin(["TP", "SL"])].copy()
     print(f"closed(TP/SL)={len(df)}")
 
@@ -49,11 +49,11 @@ def main():
     # label: TP=1, SL=0
     df["y"] = (df["status"] == "TP").astype(int)
 
-    # Features: hÂll det enkelt
+    # Features: h√•ll det enkelt
     feature_cols_num = ["dump_pct", "vol_z", "vol_ratio", "liq_ratio"]
     feature_cols_cat = ["coin"]
 
-    # s‰kerst‰ll kolumner
+    # s√§kerst√§ll kolumner
     for c in feature_cols_num:
         if c not in df.columns:
             df[c] = np.nan
@@ -61,7 +61,7 @@ def main():
         if c not in df.columns:
             df[c] = "UNKNOWN"
 
-    # droppa NaNs i numeriska (du kan ist‰llet fylla med median)
+    # droppa NaNs i numeriska (du kan ist√§llet fylla med median)
     df = df.dropna(subset=feature_cols_num).copy()
 
     X = df[feature_cols_num + feature_cols_cat]
@@ -85,7 +85,7 @@ def main():
     pipe = Pipeline([("pre", pre), ("clf", clf)])
     pipe.fit(X, y)
 
-    # plocka ut learned params fˆr att spara i DB
+    # plocka ut learned params f√∂r att spara i DB
     ohe: OneHotEncoder = pipe.named_steps["pre"].named_transformers_["cat"]
     cat_feature_names = [f"coin={c}" for c in ohe.categories_[0].tolist()]
     feature_names = feature_cols_num + cat_feature_names
