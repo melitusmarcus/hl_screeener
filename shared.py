@@ -33,6 +33,34 @@ SLIP_PER_SIDE = 0.00030
 
 SWEETSPOT_PATH = "sweetspot_coins.csv"
 
+
+# =========================
+# Helpers (NULL-safe)
+# =========================
+def _to_float(x, default=None):
+    try:
+        if x is None:
+            return default
+        # handle pandas NaN
+        if isinstance(x, float) and pd.isna(x):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def _to_ts(x) -> Optional[pd.Timestamp]:
+    try:
+        if x is None:
+            return None
+        ts = pd.to_datetime(x, utc=True, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts
+    except Exception:
+        return None
+
+
 # =========================
 # Supabase (ENV only)
 # =========================
@@ -42,6 +70,7 @@ def supabase_client_env() -> Client:
     if not url or not key:
         raise RuntimeError("Missing SUPABASE_URL / SUPABASE_SERVICE_KEY env vars.")
     return create_client(url, key)
+
 
 def db_upsert_calls(sb: Client, rows: List[Dict[str, Any]]) -> int:
     if not rows:
@@ -70,6 +99,7 @@ def db_upsert_calls(sb: Client, rows: List[Dict[str, Any]]) -> int:
     sb.table("calls").upsert(payload, on_conflict="coin,call_time").execute()
     return len(payload)
 
+
 def db_read_calls(sb: Client, limit: int = 5000) -> pd.DataFrame:
     res = sb.table("calls").select("*").order("detected_time", desc=True).limit(int(limit)).execute()
     data = getattr(res, "data", None) or []
@@ -77,13 +107,14 @@ def db_read_calls(sb: Client, limit: int = 5000) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df["call_time"] = pd.to_datetime(df["call_time"], utc=True, errors="coerce")
-    df["expiry_time"] = pd.to_datetime(df["expiry_time"], utc=True, errors="coerce")
+    df["call_time"] = pd.to_datetime(df.get("call_time"), utc=True, errors="coerce")
+    df["expiry_time"] = pd.to_datetime(df.get("expiry_time"), utc=True, errors="coerce")
     if "detected_time" in df.columns:
-        df["detected_time"] = pd.to_datetime(df["detected_time"], utc=True, errors="coerce")
+        df["detected_time"] = pd.to_datetime(df.get("detected_time"), utc=True, errors="coerce")
     else:
         df["detected_time"] = df["call_time"]
     return df
+
 
 def db_update_call(sb: Client, coin: str, call_time: pd.Timestamp, status: str, last_price: float, pnl_pct: float):
     sb.table("calls").update({
@@ -92,6 +123,7 @@ def db_update_call(sb: Client, coin: str, call_time: pd.Timestamp, status: str, 
         "pnl_pct": float(pnl_pct),
     }).eq("coin", str(coin)).eq("call_time", call_time.isoformat()).execute()
 
+
 # =========================
 # HL client (rate-limited)
 # =========================
@@ -99,6 +131,7 @@ SESSION = requests.Session()
 _last_call_ts = 0.0
 REQUEST_MIN_DELAY = 0.20
 MAX_RETRIES = 8
+
 
 def hl_post(payload: Dict[str, Any]) -> Any:
     global _last_call_ts
@@ -132,6 +165,7 @@ def hl_post(payload: Dict[str, Any]) -> Any:
 
     raise RuntimeError("HL request failed after retries")
 
+
 def fetch_hl_universe() -> List[str]:
     try:
         meta = hl_post({"type": "meta"})
@@ -148,8 +182,10 @@ def fetch_hl_universe() -> List[str]:
     except Exception:
         return []
 
+
 def to_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
+
 
 def fetch_candles(coin: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     data = hl_post({
@@ -157,19 +193,20 @@ def fetch_candles(coin: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         "req": {"coin": coin, "interval": INTERVAL, "startTime": start_ms, "endTime": end_ms}
     })
     if not data:
-        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
     df = pd.DataFrame(data)
     if "t" not in df.columns:
-        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
     df["timestamp"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    for src, dst in [("o","open"),("h","high"),("l","low"),("c","close"),("v","volume")]:
+    for src, dst in [("o", "open"), ("h", "high"), ("l", "low"), ("c", "close"), ("v", "volume")]:
         df[dst] = pd.to_numeric(df.get(src), errors="coerce")
 
-    df = df[["timestamp","open","high","low","close","volume"]].dropna()
+    df = df[["timestamp", "open", "high", "low", "close", "volume"]].dropna()
     df = df.sort_values("timestamp").drop_duplicates("timestamp")
     return df
+
 
 def load_sweetspot() -> pd.DataFrame:
     df = pd.read_csv(SWEETSPOT_PATH)
@@ -177,6 +214,7 @@ def load_sweetspot() -> pd.DataFrame:
     if "winrate" not in df.columns:
         df["winrate"] = 0.55
     return df
+
 
 def compute_chance_pct(base_wr: float, dump_pct: float, vol_z: float, vol_ratio: float, liq_ratio: float) -> float:
     wr = float(np.clip(base_wr, 0.35, 0.80))
@@ -197,11 +235,12 @@ def compute_chance_pct(base_wr: float, dump_pct: float, vol_z: float, vol_ratio:
     chance = 50 + score * 100
     return float(np.clip(chance, 5, 95))
 
+
 def build_macro_series(end: datetime) -> pd.DataFrame:
     start = end - timedelta(days=3)
     btc = fetch_candles("BTC", to_ms(start), to_ms(end))
     if btc.empty or len(btc) < 120:
-        return pd.DataFrame(columns=["timestamp","vol_z"])
+        return pd.DataFrame(columns=["timestamp", "vol_z"])
 
     ret = np.log(btc["close"]).diff()
     rv = ret.rolling(40).std(ddof=0)
@@ -210,6 +249,7 @@ def build_macro_series(end: datetime) -> pd.DataFrame:
     vol_z = (rv - mu) / sd
     out = pd.DataFrame({"timestamp": btc["timestamp"], "vol_z": vol_z}).dropna()
     return out
+
 
 def detect_call_for_coin(
     coin: str,
@@ -280,9 +320,13 @@ def detect_call_for_coin(
         "pnl_pct": 0.0,
     }
 
+
 def update_call_status(call_row: pd.Series, end: datetime) -> Dict[str, Any]:
-    coin = str(call_row["coin"])
-    call_time = pd.to_datetime(call_row["call_time"], utc=True)
+    coin = str(call_row.get("coin"))
+    call_time = _to_ts(call_row.get("call_time"))
+    if call_time is None:
+        return dict(call_row)
+
     start = call_time - timedelta(minutes=15)
 
     df = fetch_candles(coin, to_ms(start.to_pydatetime()), to_ms(end))
@@ -293,74 +337,105 @@ def update_call_status(call_row: pd.Series, end: datetime) -> Dict[str, Any]:
     if df.empty:
         return dict(call_row)
 
-    tp_price = float(call_row["tp_price"])
-    sl_price = float(call_row["sl_price"])
-    call_price = float(call_row["call_price"])
-    expiry_time = pd.to_datetime(call_row["expiry_time"], utc=True)
+    tp_price = _to_float(call_row.get("tp_price"), default=None)
+    sl_price = _to_float(call_row.get("sl_price"), default=None)
+    call_price = _to_float(call_row.get("call_price"), default=None)
+    expiry_time = _to_ts(call_row.get("expiry_time"))
 
-    hit_tp = (df["high"] >= tp_price).any()
-    hit_sl = (df["low"] <= sl_price).any()
+    if call_price is None or call_price == 0 or expiry_time is None:
+        # Not enough info to evaluate status
+        updated = dict(call_row)
+        last_price = _to_float(df["close"].iloc[-1], default=None)
+        if last_price is not None and call_price:
+            updated["last_price"] = float(last_price)
+            updated["pnl_pct"] = (float(last_price) / float(call_price) - 1.0) * 100.0
+        return updated
 
-    status = "OPEN"
+    hit_tp = False
+    hit_sl = False
+    if tp_price is not None:
+        hit_tp = (df["high"] >= float(tp_price)).any()
+    if sl_price is not None:
+        hit_sl = (df["low"] <= float(sl_price)).any()
+
+    status = str(call_row.get("status") or "OPEN")
     if hit_sl:
         status = "SL"
     elif hit_tp:
         status = "TP"
     elif datetime.now(timezone.utc) >= expiry_time.to_pydatetime():
         status = "EXPIRED"
+    else:
+        status = "OPEN"
 
-    last_price = float(df["close"].iloc[-1])
-    pnl_pct = (last_price / call_price - 1.0) * 100.0
+    last_price = _to_float(df["close"].iloc[-1], default=None)
+    if last_price is None:
+        return dict(call_row)
+
+    pnl_pct = (float(last_price) / float(call_price) - 1.0) * 100.0
 
     updated = dict(call_row)
     updated["status"] = status
-    updated["last_price"] = last_price
-    updated["pnl_pct"] = pnl_pct
+    updated["last_price"] = float(last_price)
+    updated["pnl_pct"] = float(pnl_pct)
     return updated
 
+
 def simulate_pnl(calls: pd.DataFrame, start_equity: float, notional_per_trade: float, apply_friction: bool) -> Dict[str, Any]:
-    if calls.empty:
+    """
+    NULL-safe PnL simulator: skips rows missing required numeric fields.
+    Keeps original logic for TP/SL/EXPIRED/OPEN.
+    """
+    if calls is None or calls.empty:
         return {"equity": start_equity, "pnl": 0.0, "pnl_pct": 0.0, "open_count": 0, "closed_count": 0}
 
     df = calls.copy()
-    df["call_time"] = pd.to_datetime(df["call_time"], utc=True)
+    df["call_time"] = pd.to_datetime(df.get("call_time"), utc=True, errors="coerce")
     df = df.sort_values("call_time")
 
     friction_rt = 0.0
     if apply_friction:
         friction_rt = 2.0 * (FEE_PER_SIDE + SLIP_PER_SIDE)
 
-    equity = start_equity
+    equity = float(start_equity)
     closed = 0
     open_ = 0
 
     for _, r in df.iterrows():
-        entry = float(r["call_price"])
-        lastp = float(r["last_price"])
-        status = str(r["status"])
+        entry = _to_float(r.get("call_price"), default=None)
+        lastp = _to_float(r.get("last_price"), default=None)
+        status = str(r.get("status") or "OPEN")
 
-        if status == "TP":
-            exitp = float(r["tp_price"])
+        # Skip rows that cannot be priced (prevents float(None) crash)
+        if entry is None or entry == 0 or lastp is None:
+            continue
+
+        tp_price = _to_float(r.get("tp_price"), default=None)
+        sl_price = _to_float(r.get("sl_price"), default=None)
+
+        if status == "TP" and tp_price is not None:
+            exitp = float(tp_price)
             closed += 1
-        elif status == "SL":
-            exitp = float(r["sl_price"])
+        elif status == "SL" and sl_price is not None:
+            exitp = float(sl_price)
             closed += 1
         elif status == "EXPIRED":
-            exitp = lastp
+            exitp = float(lastp)
             closed += 1
         else:
-            exitp = lastp
+            exitp = float(lastp)
             open_ += 1
 
-        ret = (exitp / entry) - 1.0
-        ret -= friction_rt
-        equity += notional_per_trade * ret
+        ret = (exitp / float(entry)) - 1.0
+        ret -= float(friction_rt)
+        equity += float(notional_per_trade) * ret
 
-    pnl = equity - start_equity
+    pnl = equity - float(start_equity)
+    pnl_pct = (pnl / float(start_equity)) * 100.0 if start_equity else 0.0
     return {
         "equity": equity,
         "pnl": pnl,
-        "pnl_pct": (pnl / start_equity) * 100.0,
+        "pnl_pct": pnl_pct,
         "open_count": open_,
         "closed_count": closed
     }

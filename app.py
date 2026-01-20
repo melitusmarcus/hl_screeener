@@ -27,16 +27,6 @@ h1, h2, h3, h4, p, div, span, label { color: #F1F5F9 !important; }
   box-shadow: 0 14px 30px rgba(0,0,0,0.50);
 }
 
-.pill {
-  display:inline-block;
-  padding: 4px 10px;
-  border-radius: 999px;
-  border: 1px solid rgba(255,255,255,0.14);
-  background: rgba(255,255,255,0.04);
-  margin-right: 6px;
-  font-size: 12px;
-}
-
 .good { color: #7CFF9B !important; }
 .bad { color: #FF6B6B !important; }
 .neutral { color: #9DB2FF !important; }
@@ -96,6 +86,30 @@ def human_age(dt: pd.Timestamp) -> str:
     return f"{days}d"
 
 
+def fmt_float(x, fmt=".6g", suffix=""):
+    """Safe float formatter that never crashes on None/NaN/strings."""
+    try:
+        if x is None:
+            return "-"
+        # pandas NaN
+        if isinstance(x, float) and pd.isna(x):
+            return "-"
+        return format(float(x), fmt) + suffix
+    except Exception:
+        return "-"
+
+
+def fmt_pct(x, fmt=".2f"):
+    try:
+        if x is None:
+            return "-"
+        if isinstance(x, float) and pd.isna(x):
+            return "-"
+        return f"{float(x):+{fmt}}%"
+    except Exception:
+        return "-"
+
+
 # Header
 st.markdown(
     f"""
@@ -109,7 +123,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Controls row (statiska, behöver inte uppdateras)
+# Controls (statiska)
 colx, coly = st.columns([1, 2])
 with colx:
     if st.button("Export calls (CSV)"):
@@ -124,17 +138,15 @@ with colx:
                 file_name="calls_export.csv",
                 mime="text/csv"
             )
-
 with coly:
     st.markdown("<div class='small neutral'>UI can sleep. Worker keeps logging.</div>", unsafe_allow_html=True)
 
 
-# Live sections (uppdateras var REFRESH_SECONDS, utan custom component)
 @st.fragment(run_every=f"{REFRESH_SECONDS}s")
 def live_sections():
     calls_all = db_read_calls(limit=200000)
 
-    # PnL Card
+    # PnL
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.subheader("PnL since start (sim)")
     if calls_all.empty:
@@ -146,9 +158,9 @@ def live_sections():
             notional_per_trade=2_000.0,
             apply_friction=True
         )
-        pnl = sim["pnl"]
-        pnl_pct = sim["pnl_pct"]
-        eq = sim["equity"]
+        pnl = sim.get("pnl", 0.0) or 0.0
+        pnl_pct = sim.get("pnl_pct", 0.0) or 0.0
+        eq = sim.get("equity", 100_000.0) or 100_000.0
         pnl_color = "good" if pnl >= 0 else "bad"
 
         st.markdown(
@@ -168,14 +180,14 @@ def live_sections():
               </div>
             </div>
             <div class="small" style="margin-top:10px;">
-              Trades simulated: closed <b>{sim["closed_count"]}</b>, open <b>{sim["open_count"]}</b>.
+              Trades simulated: closed <b>{sim.get("closed_count", 0)}</b>, open <b>{sim.get("open_count", 0)}</b>.
             </div>
             """,
             unsafe_allow_html=True
         )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Calls table
+    # Calls
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.subheader("Recent calls (Since = detected_time)")
 
@@ -195,19 +207,28 @@ def live_sections():
                 return "EXPIRED ⏳"
             return "OPEN •"
 
-        view["Status"] = view["status"].apply(status_tag)
-        view["Chance"] = view["chance_pct"].map(lambda x: f"{float(x):.0f}%")
-        view["Call px"] = view["call_price"].map(lambda x: f"{float(x):.6g}")
-        view["Now px"] = view["last_price"].map(lambda x: f"{float(x):.6g}")
-        view["Change %"] = view["pnl_pct"].map(lambda x: f"{float(x):+.2f}%")
-        view["Dump %"] = view["dump_pct"].map(lambda x: f"{float(x):.2f}%")
-        view["BTC vol_z"] = view["vol_z"].map(lambda x: f"{float(x):+.2f}")
-        view["Vol spike x"] = view["vol_ratio"].map(lambda x: f"{float(x):.2f}x")
+        view["Status"] = view.get("status", "").apply(status_tag)
 
-        out = view[[
+        # Safe formatting (no crashes on NULL)
+        view["Chance"] = view.get("chance_pct", pd.Series([None] * len(view))).map(lambda x: fmt_float(x, ".0f", "%"))
+        view["Call px"] = view.get("call_price", pd.Series([None] * len(view))).map(lambda x: fmt_float(x, ".6g"))
+        view["Now px"] = view.get("last_price", pd.Series([None] * len(view))).map(lambda x: fmt_float(x, ".6g"))
+        view["Change %"] = view.get("pnl_pct", pd.Series([None] * len(view))).map(lambda x: fmt_pct(x, ".2f"))
+        view["Dump %"] = view.get("dump_pct", pd.Series([None] * len(view))).map(lambda x: fmt_float(x, ".2f", "%"))
+        view["BTC vol_z"] = view.get("vol_z", pd.Series([None] * len(view))).map(lambda x: fmt_float(x, "+.2f"))
+        # Support both names (vol_ratio or liq_ratio)
+        if "vol_ratio" in view.columns:
+            view["Vol spike x"] = view["vol_ratio"].map(lambda x: fmt_float(x, ".2f", "x"))
+        elif "liq_ratio" in view.columns:
+            view["Vol spike x"] = view["liq_ratio"].map(lambda x: fmt_float(x, ".2f", "x"))
+        else:
+            view["Vol spike x"] = "-"
+
+        out_cols = [
             "detected_time", "Since", "call_time", "coin", "Status", "Chance", "Call px", "Now px",
             "Change %", "Dump %", "BTC vol_z", "Vol spike x"
-        ]].copy()
+        ]
+        out = view[out_cols].copy()
         out.rename(columns={
             "detected_time": "Detected (UTC)",
             "call_time": "Candle close (UTC)",
