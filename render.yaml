@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: hl-screener-ui
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+
+  - type: worker
+    name: hl-screener-worker
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python worker.py
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: WORKER_SLEEP_SECONDS
+        value: "60"
+      - key: STATUS_UPDATE_TOP_N
+        value: "120"
