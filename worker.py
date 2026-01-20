@@ -1,4 +1,5 @@
-﻿import os
+﻿# -*- coding: utf-8 -*-
+import os
 import time
 import traceback
 import pandas as pd
@@ -20,7 +21,6 @@ WORKER_SLEEP_SECONDS = int(os.getenv("WORKER_SLEEP_SECONDS", "60"))
 STATUS_UPDATE_TOP_N = int(os.getenv("STATUS_UPDATE_TOP_N", "120"))
 
 def log(msg: str):
-    # Render logs är ibland “buffered”, flush=True gör stor skillnad
     print(msg, flush=True)
 
 def main():
@@ -45,11 +45,9 @@ def main():
             now = loop_start
             detected_time = now
 
-            # 1) Load sweetspot list
             sweet = load_sweetspot().reset_index(drop=True)
             log(f"Loaded sweetspot coins: {len(sweet)}")
 
-            # 2) Intersect with HL universe (om HL meta funkar)
             hl_uni = fetch_hl_universe()
             if hl_uni:
                 hl_set = set(hl_uni)
@@ -59,22 +57,20 @@ def main():
                 universe = sweet.copy()
                 log("HL universe fetch failed. Scanning sweetspot as-is.")
 
-            # 3) Build BTC macro series
             macro = build_macro_series(now)
             if macro.empty:
                 log("⚠️ Macro empty (BTC candles missing / rate-limit). Sleeping...")
                 time.sleep(WORKER_SLEEP_SECONDS)
                 continue
 
-            # 4) Scan coins
             new_calls = []
             for _, row in universe.iterrows():
                 coin = str(row["coin"])
                 base_wr = float(row.get("winrate", 0.55))
                 scanned += 1
-
                 try:
                     c = detect_call_for_coin(
+                        sb=sb,
                         coin=coin,
                         macro=macro,
                         base_wr=base_wr,
@@ -84,17 +80,14 @@ def main():
                     if c:
                         new_calls.append(c)
                 except Exception:
-                    # En coin får inte döda hela loop
                     continue
 
             new_calls_count = len(new_calls)
             inserted = db_upsert_calls(sb, new_calls)
 
-            # 5) Status updates (senaste N calls)
             calls_recent = db_read_calls(sb, limit=2000)
             if not calls_recent.empty:
                 recent = calls_recent.sort_values("call_time", ascending=False).head(STATUS_UPDATE_TOP_N).copy()
-
                 for _, r in recent.iterrows():
                     try:
                         upd = update_call_status(r, now)
@@ -113,7 +106,6 @@ def main():
 
             loop_end = datetime.now(timezone.utc)
             dt = (loop_end - loop_start).total_seconds()
-
             log(
                 f"✅ loop done in {dt:.1f}s | scanned={scanned} new_calls={new_calls_count} "
                 f"upserted={inserted} status_updates={updated_n}"
