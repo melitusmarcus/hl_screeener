@@ -3,6 +3,7 @@ import time
 import traceback
 import pandas as pd
 from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, Optional, List
 
 from shared import (
     supabase_client_env,
@@ -14,9 +15,11 @@ from shared import (
     db_read_calls,
     update_call_status,
     db_update_call,
+    fetch_candles,
+    to_ms,
 )
 
-WORKER_VERSION = "v2026-01-21-hl429fix"
+WORKER_VERSION = "v2026-01-21-ui-scan-snapshot"
 
 HEARTBEAT_NAME = "scanner"
 SCAN_SLEEP_SECONDS = int(os.getenv("WORKER_SLEEP_SECONDS", "60"))
@@ -24,7 +27,6 @@ STATUS_UPDATE_TOP_N = int(os.getenv("STATUS_UPDATE_TOP_N", "120"))
 UPDATE_OPEN_LOOKBACK_HOURS = int(os.getenv("UPDATE_OPEN_LOOKBACK_HOURS", "24"))
 HEARTBEAT_PROGRESS_EVERY = int(os.getenv("HEARTBEAT_PROGRESS_EVERY", "10"))
 
-# New: reduce HL load
 SCAN_ONLY_ON_NEW_15M_BAR = os.getenv("SCAN_ONLY_ON_NEW_15M_BAR", "1") == "1"
 STATUS_UPDATE_EVERY_N_SCANS = int(os.getenv("STATUS_UPDATE_EVERY_N_SCANS", "3"))
 
@@ -39,6 +41,40 @@ def hb(sb, note: str):
     ).execute()
     print(f"[hb] {WORKER_VERSION} | {note}", flush=True)
 
+def upsert_scan_snapshots(sb, snapshots: List[Dict[str, Any]]) -> int:
+    if not snapshots:
+        return 0
+    sb.table("scan_snapshots").upsert(snapshots, on_conflict="coin,bar_time").execute()
+    return len(snapshots)
+
+def get_last_bar_snapshot(coin: str, now_utc: datetime) -> Optional[Dict[str, Any]]:
+    """
+    Fetch last 2 candles to compute 15m change%.
+    Extra HL call per coin, but we only run on new 15m bar.
+    """
+    start = now_utc - timedelta(hours=2)
+    df = fetch_candles(coin, to_ms(start), to_ms(now_utc))
+    if df is None or df.empty or len(df) < 2:
+        return None
+
+    df = df.sort_values("timestamp").drop_duplicates("timestamp")
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    last_close = float(last["close"])
+    prev_close = float(prev["close"]) if float(prev["close"]) != 0 else last_close
+    chg = (last_close / prev_close - 1.0) * 100.0
+
+    bar_time = pd.to_datetime(last["timestamp"], utc=True).to_pydatetime()
+
+    return {
+        "coin": str(coin),
+        "bar_time": bar_time.isoformat(),
+        "updated_time": now_utc.isoformat(),
+        "close_price": last_close,
+        "change_15m_pct": float(chg),
+    }
+
 def main():
     sb = supabase_client_env()
     hb(sb, "BOOT: started")
@@ -48,7 +84,6 @@ def main():
     coins = sweet["coin"].tolist()
     hb(sb, f"Loaded sweetspot coins: {len(coins)}")
 
-    # Filter against HL universe (optional but good)
     try:
         uni = set(fetch_hl_universe())
         coins = [c for c in coins if c in uni]
@@ -64,6 +99,7 @@ def main():
         scanned = 0
         found = 0
         upserted = 0
+        snap_upserted = 0
 
         try:
             hb(sb, "LOOP: start")
@@ -74,7 +110,6 @@ def main():
                 time.sleep(SCAN_SLEEP_SECONDS)
                 continue
 
-            # --- only scan when a new 15m bar has formed ---
             if SCAN_ONLY_ON_NEW_15M_BAR:
                 try:
                     current_bar_ts = pd.to_datetime(macro["timestamp"].iloc[-1], utc=True)
@@ -82,15 +117,16 @@ def main():
                     current_bar_ts = None
 
                 if current_bar_ts is not None and last_bar_ts is not None and current_bar_ts <= last_bar_ts:
-                    hb(sb, f"no new 15m bar -> skip scan ({current_bar_ts.isoformat()})")
+                    hb(sb, f"no new 15m bar -> skip ({current_bar_ts.isoformat()})")
                     time.sleep(SCAN_SLEEP_SECONDS)
                     continue
 
                 last_bar_ts = current_bar_ts
                 hb(sb, f"new 15m bar -> scanning ({last_bar_ts.isoformat() if last_bar_ts is not None else 'na'})")
 
-            # --- scanning ---
             new_rows = []
+            snapshots = []
+
             for i, coin in enumerate(coins, start=1):
                 scanned += 1
                 if i % HEARTBEAT_PROGRESS_EVERY == 0:
@@ -104,6 +140,15 @@ def main():
                 except Exception:
                     pass
 
+                # Snapshot for UI (price + 15m change)
+                try:
+                    s = get_last_bar_snapshot(coin, loop_start)
+                    if s:
+                        snapshots.append(s)
+                except Exception as e:
+                    print(f"[snap][WARN] {coin} snapshot failed: {e}", flush=True)
+
+                # Signal detection
                 try:
                     call = detect_call_for_coin(
                         coin=coin,
@@ -126,11 +171,17 @@ def main():
                 try:
                     upserted = db_upsert_calls(sb, new_rows)
                 except Exception as e:
-                    hb(sb, f"ERROR upsert: {type(e).__name__}: {str(e)[:120]}")
-                    print("[ERROR] upsert failed:", e, flush=True)
-                    upserted = 0
+                    hb(sb, f"ERROR upsert calls: {type(e).__name__}: {str(e)[:120]}")
+                    print("[ERROR] upsert calls failed:", e, flush=True)
 
-            # --- status updates less often ---
+            if snapshots:
+                try:
+                    snap_upserted = upsert_scan_snapshots(sb, snapshots)
+                except Exception as e:
+                    hb(sb, f"ERROR upsert snapshots: {type(e).__name__}: {str(e)[:120]}")
+                    print("[ERROR] upsert snapshots failed:", e, flush=True)
+
+            # Status update less often
             if scan_count % STATUS_UPDATE_EVERY_N_SCANS == 0:
                 try:
                     calls_df = db_read_calls(sb, limit=4000)
@@ -140,7 +191,6 @@ def main():
                         if not open_df.empty:
                             open_df = open_df.sort_values("call_time", ascending=False).head(STATUS_UPDATE_TOP_N)
 
-                        updated = 0
                         for _, row in open_df.iterrows():
                             try:
                                 upd = update_call_status(row, end=loop_start)
@@ -157,22 +207,15 @@ def main():
                                         last_price=float(upd.get("last_price", row.get("last_price") or 0.0)),
                                         pnl_pct=float(upd.get("pnl_pct", row.get("pnl_pct") or 0.0)),
                                     )
-                                    updated += 1
                             except Exception as e:
                                 print("[status][WARN]", e, flush=True)
-
-                        if updated:
-                            print(f"[status] updated_open={updated}", flush=True)
-
                 except Exception as e:
                     hb(sb, f"ERROR status: {type(e).__name__}: {str(e)[:120]}")
                     print("[ERROR] status update failed:", e, flush=True)
-            else:
-                print(f"[status] skip (scan_count={scan_count})", flush=True)
 
             dur = (datetime.now(timezone.utc) - loop_start).total_seconds()
-            hb(sb, f"done {dur:.1f}s | scanned={scanned} found={found} upserted={upserted} | scan_count={scan_count}")
-            print(f"[loop] done {dur:.1f}s | scanned={scanned} found={found} upserted={upserted} -> sleep {SCAN_SLEEP_SECONDS}s", flush=True)
+            hb(sb, f"done {dur:.1f}s | scanned={scanned} found={found} calls_upserted={upserted} snaps_upserted={snap_upserted}")
+            print(f"[loop] done {dur:.1f}s | scanned={scanned} found={found} calls={upserted} snaps={snap_upserted} -> sleep {SCAN_SLEEP_SECONDS}s", flush=True)
             time.sleep(SCAN_SLEEP_SECONDS)
 
         except Exception as e:
@@ -186,19 +229,4 @@ def main():
             time.sleep(60)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        try:
-            sb = supabase_client_env()
-            sb.table("worker_heartbeat").upsert(
-                {
-                    "name": HEARTBEAT_NAME,
-                    "last_seen": datetime.now(timezone.utc).isoformat(),
-                    "note": f"{WORKER_VERSION} | FATAL STARTUP: {type(e).__name__}: {str(e)[:180]}",
-                },
-                on_conflict="name",
-            ).execute()
-        except Exception:
-            pass
-        raise
+    main()
