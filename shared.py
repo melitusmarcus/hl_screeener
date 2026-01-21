@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
 import os
 import time
-import math
 import random
 import requests
 import numpy as np
@@ -16,8 +14,9 @@ HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 # =========================
 # CONFIG (shared)
 # =========================
-INTERVAL = "15m"
+INTERVAL = "15m"  # HL candle interval
 
+# Dump gate (long-bounce)
 DROP_MIN = 0.005
 DROP_MAX = 0.05
 
@@ -28,7 +27,7 @@ VOL_FLOOR_MULT = 1.20
 
 TP = 0.015
 SL = 0.020
-HOLD_BARS = 24  # 6h
+HOLD_BARS = 24  # 24 * 15m = 6h
 
 FEE_PER_SIDE = 0.00045
 SLIP_PER_SIDE = 0.00030
@@ -36,7 +35,7 @@ SLIP_PER_SIDE = 0.00030
 SWEETSPOT_PATH = "sweetspot_coins.csv"
 
 # =========================
-# Supabase (ENV)
+# Supabase (ENV only)
 # =========================
 def supabase_client_env() -> Client:
     url = os.getenv("SUPABASE_URL")
@@ -45,31 +44,43 @@ def supabase_client_env() -> Client:
         raise RuntimeError("Missing SUPABASE_URL / SUPABASE_SERVICE_KEY env vars.")
     return create_client(url, key)
 
-# =========================
-# DB
-# =========================
 def db_upsert_calls(sb: Client, rows: List[Dict[str, Any]]) -> int:
+    """
+    Upsert rows into public.calls. Expects NOT NULL columns to be present.
+    """
     if not rows:
         return 0
 
     payload = []
     for r in rows:
+        # Defensive defaults to avoid None -> NOT NULL errors
+        call_time = r.get("call_time")
+        detected_time = r.get("detected_time") or call_time
+        expiry_time = r.get("expiry_time")
+
+        call_price = r.get("call_price")
+        tp_price = r.get("tp_price")
+        sl_price = r.get("sl_price")
+
+        last_price = r.get("last_price", call_price)
+        pnl_pct = r.get("pnl_pct", 0.0)
+
         payload.append({
-            "call_time": r["call_time"].isoformat(),
-            "detected_time": r["detected_time"].isoformat(),
-            "coin": r["coin"],
-            "call_price": float(r["call_price"]),
-            "tp_price": float(r["tp_price"]),
-            "sl_price": float(r["sl_price"]),
-            "expiry_time": r["expiry_time"].isoformat(),
-            "dump_pct": float(r["dump_pct"]),
-            "vol_z": float(r["vol_z"]),
-            "vol_ratio": float(r["vol_ratio"]),
-            "liq_ratio": float(r["liq_ratio"]),
-            "chance_pct": float(r["chance_pct"]),
-            "status": str(r["status"]),
-            "last_price": float(r["last_price"]),
-            "pnl_pct": float(r["pnl_pct"]),
+            "call_time": pd.to_datetime(call_time, utc=True).isoformat() if call_time is not None else None,
+            "detected_time": pd.to_datetime(detected_time, utc=True).isoformat() if detected_time is not None else None,
+            "coin": str(r.get("coin")),
+            "call_price": float(call_price) if call_price is not None else 0.0,
+            "tp_price": float(tp_price) if tp_price is not None else 0.0,
+            "sl_price": float(sl_price) if sl_price is not None else 0.0,
+            "expiry_time": pd.to_datetime(expiry_time, utc=True).isoformat() if expiry_time is not None else None,
+            "dump_pct": float(r.get("dump_pct", 0.0)),
+            "vol_z": float(r.get("vol_z", 0.0)),
+            "vol_ratio": float(r.get("vol_ratio", 0.0)),
+            "liq_ratio": float(r.get("liq_ratio", 0.0)),
+            "chance_pct": float(r.get("chance_pct", 50.0)),
+            "status": str(r.get("status", "OPEN")),
+            "last_price": float(last_price) if last_price is not None else float(call_price or 0.0),
+            "pnl_pct": float(pnl_pct) if pnl_pct is not None else 0.0,
         })
 
     sb.table("calls").upsert(payload, on_conflict="coin,call_time").execute()
@@ -81,12 +92,10 @@ def db_read_calls(sb: Client, limit: int = 5000) -> pd.DataFrame:
     df = pd.DataFrame(data)
     if df.empty:
         return df
+
     df["call_time"] = pd.to_datetime(df["call_time"], utc=True, errors="coerce")
     df["expiry_time"] = pd.to_datetime(df["expiry_time"], utc=True, errors="coerce")
-    if "detected_time" in df.columns:
-        df["detected_time"] = pd.to_datetime(df["detected_time"], utc=True, errors="coerce")
-    else:
-        df["detected_time"] = df["call_time"]
+    df["detected_time"] = pd.to_datetime(df.get("detected_time", df["call_time"]), utc=True, errors="coerce")
     return df
 
 def db_update_call(sb: Client, coin: str, call_time: pd.Timestamp, status: str, last_price: float, pnl_pct: float):
@@ -94,10 +103,10 @@ def db_update_call(sb: Client, coin: str, call_time: pd.Timestamp, status: str, 
         "status": str(status),
         "last_price": float(last_price),
         "pnl_pct": float(pnl_pct),
-    }).eq("coin", str(coin)).eq("call_time", call_time.isoformat()).execute()
+    }).eq("coin", str(coin)).eq("call_time", pd.to_datetime(call_time, utc=True).isoformat()).execute()
 
 # =========================
-# HL Client (rate limited)
+# HL client (rate-limited)
 # =========================
 SESSION = requests.Session()
 _last_call_ts = 0.0
@@ -122,7 +131,7 @@ def hl_post(payload: Dict[str, Any]) -> Any:
                 continue
 
             if r.status_code in (500, 502, 503, 504):
-                time.sleep(backoff + random.uniform(0, 0.4))
+                time.sleep(backoff + random.uniform(0,  0.4))
                 backoff = min(backoff * 1.7, 10.0)
                 continue
 
@@ -159,51 +168,15 @@ def fetch_candles(coin: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     df = df.sort_values("timestamp").drop_duplicates("timestamp")
     return df
 
-def fetch_hl_universe() -> List[str]:
-    try:
-        meta = hl_post({"type": "meta"})
-        coins: List[str] = []
-        if isinstance(meta, dict):
-            uni = meta.get("universe")
-            if isinstance(uni, list):
-                for item in uni:
-                    if isinstance(item, dict):
-                        name = item.get("name")
-                        if isinstance(name, str) and name:
-                            coins.append(name)
-        return sorted(list(set(coins)))
-    except Exception:
-        return []
-
-# =========================
-# Sweetspot
-# =========================
 def load_sweetspot() -> pd.DataFrame:
     df = pd.read_csv(SWEETSPOT_PATH)
-    df["coin"] = df["coin"].astype(str)
+    df["coin"] = df["coin"].astype(str).str.upper().str.strip()
     if "winrate" not in df.columns:
         df["winrate"] = 0.55
     return df
 
 # =========================
-# Macro series
-# =========================
-def build_macro_series(end: datetime) -> pd.DataFrame:
-    start = end - timedelta(days=3)
-    btc = fetch_candles("BTC", to_ms(start), to_ms(end))
-    if btc.empty or len(btc) < 120:
-        return pd.DataFrame(columns=["timestamp","vol_z"])
-
-    ret = np.log(btc["close"]).diff()
-    rv = ret.rolling(40).std(ddof=0)
-    mu = rv.rolling(40).mean()
-    sd = rv.rolling(40).std(ddof=0)
-    vol_z = (rv - mu) / sd
-    out = pd.DataFrame({"timestamp": btc["timestamp"], "vol_z": vol_z}).dropna()
-    return out
-
-# =========================
-# Chance: Heuristic fallback
+# Chance heuristic
 # =========================
 def compute_chance_pct(base_wr: float, dump_pct: float, vol_z: float, vol_ratio: float, liq_ratio: float) -> float:
     wr = float(np.clip(base_wr, 0.35, 0.80))
@@ -225,78 +198,44 @@ def compute_chance_pct(base_wr: float, dump_pct: float, vol_z: float, vol_ratio:
     return float(np.clip(chance, 5, 95))
 
 # =========================
-# ML model (cache + inference)
+# Macro series (BTC vol_z)
 # =========================
-_MODEL_CACHE = {"ts": 0.0, "payload": None}
-_MODEL_TTL = 600  # seconds
+def build_macro_series(end: datetime) -> pd.DataFrame:
+    start = end - timedelta(days=3)
+    btc = fetch_candles("BTC", to_ms(start), to_ms(end))
+    if btc.empty or len(btc) < 120:
+        return pd.DataFrame(columns=["timestamp","vol_z"])
 
-def load_chance_model(sb: Client) -> Optional[dict]:
-    now = time.time()
-    if _MODEL_CACHE["payload"] is not None and (now - _MODEL_CACHE["ts"] < _MODEL_TTL):
-        return _MODEL_CACHE["payload"]
-
-    res = sb.table("model_params").select("payload").eq("id", "chance_model_v1").execute()
-    data = getattr(res, "data", None) or []
-    if not data:
-        return None
-
-    payload = data[0].get("payload")
-    if not payload:
-        return None
-
-    _MODEL_CACHE["payload"] = payload
-    _MODEL_CACHE["ts"] = now
-    return payload
-
-def _sigmoid(x: float) -> float:
-    # safe sigmoid
-    if x >= 0:
-        z = math.exp(-x)
-        return 1.0 / (1.0 + z)
-    else:
-        z = math.exp(x)
-        return z / (1.0 + z)
-
-def ml_chance_pct(model: dict, dump_pct: float, vol_z: float, vol_ratio: float, liq_ratio: float, coin: str) -> Optional[float]:
-    if not model:
-        return None
-    try:
-        features = model["features"]
-        coef = model["coef"]
-        intercept = float(model["intercept"])
-        if len(features) != len(coef):
-            return None
-
-        feat_map = {
-            "dump_pct": float(dump_pct),
-            "vol_z": float(vol_z),
-            "vol_ratio": float(vol_ratio),
-            "liq_ratio": float(liq_ratio),
-            f"coin={coin}": 1.0,
-        }
-
-        z = intercept
-        for name, w in zip(features, coef):
-            v = feat_map.get(name)
-            if v is not None:
-                z += float(w) * float(v)
-
-        p = _sigmoid(z)
-        return float(np.clip(100.0 * p, 5.0, 95.0))
-    except Exception:
-        return None
+    ret = np.log(btc["close"]).diff()
+    rv = ret.rolling(40).std(ddof=0)
+    mu = rv.rolling(40).mean()
+    sd = rv.rolling(40).std(ddof=0)
+    vol_z = (rv - mu) / sd
+    out = pd.DataFrame({"timestamp": btc["timestamp"], "vol_z": vol_z}).dropna()
+    return out
 
 # =========================
-# Signal detection
+# Call detection (BACKWARD COMPAT)
 # =========================
 def detect_call_for_coin(
-    sb: Client,
     coin: str,
     macro: pd.DataFrame,
     base_wr: float,
     end: datetime,
     detected_time: datetime,
+    vol_z_max: float = VOL_Z_MAX,
+    vol_spike_mult: float = VOL_SPIKE_MULT,
+    vol_floor_mult: float = VOL_FLOOR_MULT,
+    drop_min: float = DROP_MIN,
+    drop_max: float = DROP_MAX,
 ) -> Optional[Dict[str, Any]]:
+    """
+    Long-bounce signal:
+    - dump on candle: (open - low)/open in [drop_min, drop_max]
+    - macro calm: abs(BTC vol_z) <= vol_z_max
+    - volume spike: volume/median(volume, VOL_WIN) >= vol_spike_mult
+    - liquidity floor: volume/median(volume, VOL_WIN) >= vol_floor_mult
+    """
     start = end - timedelta(days=3)
     df = fetch_candles(coin, to_ms(start), to_ms(end))
     if df.empty or len(df) < (VOL_WIN + 5):
@@ -319,10 +258,10 @@ def detect_call_for_coin(
     vol_ratio = float(last["volume"] / medv)
     liq_ratio = float(last["volume"] / medv)
 
-    dump_ok = (dump_pct >= DROP_MIN) and (dump_pct <= DROP_MAX)
-    macro_ok = (abs(vol_z) <= VOL_Z_MAX)
-    spike_ok = (vol_ratio >= VOL_SPIKE_MULT)
-    floor_ok = (liq_ratio >= VOL_FLOOR_MULT)
+    dump_ok = (dump_pct >= float(drop_min)) and (dump_pct <= float(drop_max))
+    macro_ok = (abs(vol_z) <= float(vol_z_max))
+    spike_ok = (vol_ratio >= float(vol_spike_mult))
+    floor_ok = (liq_ratio >= float(vol_floor_mult))
 
     if not (dump_ok and macro_ok and spike_ok and floor_ok):
         return None
@@ -333,26 +272,13 @@ def detect_call_for_coin(
     sl_price = call_price * (1 - SL)
     expiry_time = call_time + timedelta(minutes=15 * HOLD_BARS)
 
-    # ML first, heuristic fallback
-    model = load_chance_model(sb)
-    ml_pct = ml_chance_pct(
-        model=model,
-        dump_pct=dump_pct * 100.0,  # keep same unit as stored column
-        vol_z=vol_z,
-        vol_ratio=vol_ratio,
-        liq_ratio=liq_ratio,
-        coin=coin,
+    chance_pct = compute_chance_pct(
+        base_wr=float(base_wr),
+        dump_pct=float(dump_pct),
+        vol_z=float(vol_z),
+        vol_ratio=float(vol_ratio),
+        liq_ratio=float(liq_ratio),
     )
-    if ml_pct is None:
-        chance_pct = compute_chance_pct(
-            base_wr=float(base_wr),
-            dump_pct=float(dump_pct),
-            vol_z=float(vol_z),
-            vol_ratio=float(vol_ratio),
-            liq_ratio=float(liq_ratio),
-        )
-    else:
-        chance_pct = float(ml_pct)
 
     return {
         "call_time": pd.Timestamp(call_time, tz=timezone.utc),
@@ -372,6 +298,9 @@ def detect_call_for_coin(
         "pnl_pct": 0.0,
     }
 
+# =========================
+# Status update
+# =========================
 def update_call_status(call_row: pd.Series, end: datetime) -> Dict[str, Any]:
     coin = str(call_row["coin"])
     call_time = pd.to_datetime(call_row["call_time"], utc=True)
@@ -394,6 +323,7 @@ def update_call_status(call_row: pd.Series, end: datetime) -> Dict[str, Any]:
     hit_sl = (df["low"] <= sl_price).any()
 
     status = "OPEN"
+    # conservative: SL first
     if hit_sl:
         status = "SL"
     elif hit_tp:
@@ -409,3 +339,58 @@ def update_call_status(call_row: pd.Series, end: datetime) -> Dict[str, Any]:
     updated["last_price"] = last_price
     updated["pnl_pct"] = pnl_pct
     return updated
+
+# =========================
+# PnL simulation (hardened)
+# =========================
+def simulate_pnl(calls: pd.DataFrame, start_equity: float, notional_per_trade: float, apply_friction: bool) -> Dict[str, Any]:
+    if calls.empty:
+        return {"equity": start_equity, "pnl": 0.0, "pnl_pct": 0.0, "open_count": 0, "closed_count": 0}
+
+    df = calls.copy()
+    df["call_time"] = pd.to_datetime(df["call_time"], utc=True, errors="coerce")
+    df = df.sort_values("call_time")
+
+    friction_rt = 0.0
+    if apply_friction:
+        friction_rt = 2.0 * (FEE_PER_SIDE + SLIP_PER_SIDE)
+
+    equity = float(start_equity)
+    closed = 0
+    open_ = 0
+
+    for _, r in df.iterrows():
+        entry = float(r.get("call_price") or 0.0)
+        status = str(r.get("status") or "OPEN")
+
+        lastp_val = r.get("last_price")
+        lastp = float(lastp_val) if lastp_val is not None else entry
+
+        if status == "TP":
+            exitp = float(r.get("tp_price") or lastp or entry)
+            closed += 1
+        elif status == "SL":
+            exitp = float(r.get("sl_price") or lastp or entry)
+            closed += 1
+        elif status == "EXPIRED":
+            exitp = lastp
+            closed += 1
+        else:
+            exitp = lastp
+            open_ += 1
+
+        if entry <= 0:
+            continue
+
+        ret = (exitp / entry) - 1.0
+        ret -= friction_rt
+        equity += float(notional_per_trade) * ret
+
+    pnl = equity - float(start_equity)
+    return {
+        "equity": equity,
+        "pnl": pnl,
+        "pnl_pct": (pnl / float(start_equity)) * 100.0,
+        "open_count": open_,
+        "closed_count": closed
+    }
