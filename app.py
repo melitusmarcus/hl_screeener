@@ -252,8 +252,10 @@ def latest_scan_section():
 
 # Render page
 pnl_section()
-c1, c2 = st.columns([1, 1])
-with c1:
-    latest_scan_section()
-with c2:
-    positions_section()
+
+# Positions överst
+positions_section()
+
+# Latest scan under
+latest_scan_section()
+
