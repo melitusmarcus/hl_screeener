@@ -43,87 +43,37 @@ def supabase_client_env() -> Client:
         raise RuntimeError("Missing SUPABASE_URL / SUPABASE_SERVICE_KEY env vars.")
     return create_client(url, key)
 
-def db_upsert_calls(sb: Client, rows: List[Dict[str, Any]]) -> int:
-    if not rows:
-        return 0
+# =========================
+# Helpers
+# =========================
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
-    payload = []
-    for r in rows:
-        payload.append({
-            "call_time": pd.to_datetime(r["call_time"], utc=True).isoformat(),
-            "detected_time": pd.to_datetime(r["detected_time"], utc=True).isoformat(),
-            "coin": str(r["coin"]),
-            "call_price": float(r["call_price"]),
-            "tp_price": float(r["tp_price"]),
-            "sl_price": float(r["sl_price"]),
-            "expiry_time": pd.to_datetime(r["expiry_time"], utc=True).isoformat(),
-            "dump_pct": float(r["dump_pct"]),
-            "vol_z": float(r["vol_z"]),
-            "vol_ratio": float(r["vol_ratio"]),
-            "liq_ratio": float(r["liq_ratio"]),
-            "chance_pct": float(r["chance_pct"]),
-            "status": str(r["status"]),
-            "last_price": float(r["last_price"]),
-            "pnl_pct": float(r["pnl_pct"]),
-        })
+def to_ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
 
-    sb.table("calls").upsert(payload, on_conflict="coin,call_time").execute()
-    return len(payload)
+def as_utc_ts(x) -> pd.Timestamp:
+    # robust UTC parse
+    ts = pd.to_datetime(x, utc=True, errors="coerce")
+    if isinstance(ts, pd.Timestamp) and ts.tzinfo is None:
+        ts = ts.tz_localize(timezone.utc)
+    return ts
 
-def db_read_calls(sb: Client, limit: int = 5000) -> pd.DataFrame:
-    res = sb.table("calls").select("*").order("detected_time", desc=True).limit(int(limit)).execute()
-    data = getattr(res, "data", None) or []
-    df = pd.DataFrame(data)
-    if df.empty:
-        return df
-
-    df["call_time"] = pd.to_datetime(df["call_time"], utc=True, errors="coerce")
-    df["expiry_time"] = pd.to_datetime(df["expiry_time"], utc=True, errors="coerce")
-    if "detected_time" in df.columns:
-        df["detected_time"] = pd.to_datetime(df["detected_time"], utc=True, errors="coerce")
-    else:
-        df["detected_time"] = df["call_time"]
-
-    if "ui_first_seen_time" in df.columns:
-        df["ui_first_seen_time"] = pd.to_datetime(df["ui_first_seen_time"], utc=True, errors="coerce")
-
-    return df
-
-def db_update_call(sb: Client, coin: str, call_time: pd.Timestamp, status: str, last_price: float, pnl_pct: float):
-    ct = pd.to_datetime(call_time, utc=True)
-    sb.table("calls").update({
-        "status": str(status),
-        "last_price": float(last_price),
-        "pnl_pct": float(pnl_pct),
-    }).eq("coin", str(coin)).eq("call_time", ct.isoformat()).execute()
-
-def db_mark_ui_first_seen(sb: Client, coin: str, call_time: pd.Timestamp, now_utc: Optional[datetime] = None) -> None:
-    """
-    Sets ui_first_seen_time once per (coin, call_time). Safe to call repeatedly.
-    """
-    if now_utc is None:
-        now_utc = datetime.now(timezone.utc)
-    ct = pd.to_datetime(call_time, utc=True)
-
-    # Some supabase clients support .is_(); if yours doesn't, replace with .filter("ui_first_seen_time","is","null")
-    q = sb.table("calls").update({"ui_first_seen_time": now_utc.isoformat()}) \
-        .eq("coin", str(coin)).eq("call_time", ct.isoformat())
-
+def safe_float(x, default=np.nan) -> float:
     try:
-        q = q.is_("ui_first_seen_time", "null")
+        if x is None:
+            return default
+        return float(x)
     except Exception:
-        # fallback
-        q = q.filter("ui_first_seen_time", "is", "null")
-
-    q.execute()
+        return default
 
 # =========================
 # HL client (rate-limited)
 # =========================
 SESSION = requests.Session()
 _last_call_ts = 0.0
-REQUEST_MIN_DELAY = 0.20
-MAX_RETRIES = 8
+REQUEST_MIN_DELAY = float(os.getenv("HL_REQUEST_MIN_DELAY", "0.35"))  # slower to reduce 429
+MAX_RETRIES = int(os.getenv("HL_MAX_RETRIES", "8"))
 
 def hl_post(payload: Dict[str, Any]) -> Any:
     global _last_call_ts
@@ -132,22 +82,23 @@ def hl_post(payload: Dict[str, Any]) -> Any:
     if wait > 0:
         time.sleep(wait)
 
-    backoff = 0.6
+    backoff = 0.8
     last_err = None
+
     for _ in range(MAX_RETRIES):
         try:
-            r = SESSION.post(HL_INFO_URL, json=payload, timeout=20)
+            r = SESSION.post(HL_INFO_URL, json=payload, timeout=25)
 
             if r.status_code == 429:
-                last_err = f"HTTP 429 rate-limited"
-                time.sleep(backoff + random.uniform(0, 0.4))
-                backoff = min(backoff * 1.7, 10.0)
+                last_err = "HTTP 429 rate-limited"
+                time.sleep(backoff + random.uniform(0, 0.6))
+                backoff = min(backoff * 1.8, 12.0)
                 continue
 
             if r.status_code in (500, 502, 503, 504):
                 last_err = f"HTTP {r.status_code} server error"
-                time.sleep(backoff + random.uniform(0, 0.4))
-                backoff = min(backoff * 1.7, 10.0)
+                time.sleep(backoff + random.uniform(0, 0.6))
+                backoff = min(backoff * 1.8, 12.0)
                 continue
 
             r.raise_for_status()
@@ -156,34 +107,28 @@ def hl_post(payload: Dict[str, Any]) -> Any:
 
         except requests.RequestException as e:
             last_err = str(e)
-            time.sleep(backoff + random.uniform(0, 0.4))
-            backoff = min(backoff * 1.7, 10.0)
+            time.sleep(backoff + random.uniform(0, 0.6))
+            backoff = min(backoff * 1.8, 12.0)
 
     raise RuntimeError(f"HL request failed after retries. last_err={last_err}")
 
 def fetch_hl_universe() -> List[str]:
-    try:
-        meta = hl_post({"type": "meta"})
-        coins: List[str] = []
-        if isinstance(meta, dict):
-            uni = meta.get("universe")
-            if isinstance(uni, list):
-                for item in uni:
-                    if isinstance(item, dict):
-                        name = item.get("name")
-                        if isinstance(name, str) and name:
-                            coins.append(name)
-        return sorted(list(set(coins)))
-    except Exception:
-        return []
-
-def to_ms(dt: datetime) -> int:
-    return int(dt.timestamp() * 1000)
+    meta = hl_post({"type": "meta"})
+    coins: List[str] = []
+    if isinstance(meta, dict):
+        uni = meta.get("universe")
+        if isinstance(uni, list):
+            for item in uni:
+                if isinstance(item, dict):
+                    name = item.get("name")
+                    if isinstance(name, str) and name:
+                        coins.append(name)
+    return sorted(list(set(coins)))
 
 def fetch_candles(coin: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     data = hl_post({
         "type": "candleSnapshot",
-        "req": {"coin": coin, "interval": INTERVAL, "startTime": start_ms, "endTime": end_ms}
+        "req": {"coin": coin, "interval": INTERVAL, "startTime": int(start_ms), "endTime": int(end_ms)}
     })
     if not data:
         return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
@@ -207,6 +152,26 @@ def load_sweetspot() -> pd.DataFrame:
         df["winrate"] = 0.55
     return df
 
+# =========================
+# Macro series (BTC vol_z)
+# =========================
+def build_macro_series(end: datetime) -> pd.DataFrame:
+    start = end - timedelta(days=3)
+    btc = fetch_candles("BTC", to_ms(start), to_ms(end))
+    if btc.empty or len(btc) < 120:
+        return pd.DataFrame(columns=["timestamp","vol_z"])
+
+    ret = np.log(btc["close"]).diff()
+    rv = ret.rolling(40).std(ddof=0)
+    mu = rv.rolling(40).mean()
+    sd = rv.rolling(40).std(ddof=0)
+    vol_z = (rv - mu) / sd
+    out = pd.DataFrame({"timestamp": btc["timestamp"], "vol_z": vol_z}).dropna()
+    return out
+
+# =========================
+# Chance heuristic
+# =========================
 def compute_chance_pct(base_wr: float, dump_pct: float, vol_z: float, vol_ratio: float, liq_ratio: float) -> float:
     wr = float(np.clip(base_wr, 0.35, 0.80))
     score = (wr - 0.50)
@@ -226,26 +191,15 @@ def compute_chance_pct(base_wr: float, dump_pct: float, vol_z: float, vol_ratio:
     chance = 50 + score * 100
     return float(np.clip(chance, 5, 95))
 
-def build_macro_series(end: datetime) -> pd.DataFrame:
-    start = end - timedelta(days=3)
-    btc = fetch_candles("BTC", to_ms(start), to_ms(end))
-    if btc.empty or len(btc) < 120:
-        return pd.DataFrame(columns=["timestamp","vol_z"])
-
-    ret = np.log(btc["close"]).diff()
-    rv = ret.rolling(40).std(ddof=0)
-    mu = rv.rolling(40).mean()
-    sd = rv.rolling(40).std(ddof=0)
-    vol_z = (rv - mu) / sd
-    out = pd.DataFrame({"timestamp": btc["timestamp"], "vol_z": vol_z}).dropna()
-    return out
-
+# =========================
+# Detect call
+# =========================
 def detect_call_for_coin(
     coin: str,
     macro: pd.DataFrame,
     base_wr: float,
     end: datetime,
-    detected_time: datetime
+    detected_time: datetime,
 ) -> Optional[Dict[str, Any]]:
     start = end - timedelta(days=3)
     df = fetch_candles(coin, to_ms(start), to_ms(end))
@@ -309,15 +263,17 @@ def detect_call_for_coin(
         "pnl_pct": 0.0,
     }
 
+# =========================
+# Position status update (OPEN -> TP/SL/EXPIRED) + live last_price/pnl
+# =========================
 def update_call_status(call_row: pd.Series, end: datetime) -> Dict[str, Any]:
-    """
-    IMPORTANT FIX:
-    If TP/SL hit, pin last_price to tp_price/sl_price so UI/PnL can't show TP with 0.00%.
-    """
-    coin = str(call_row["coin"])
-    call_time = pd.to_datetime(call_row["call_time"], utc=True)
-    start = call_time - timedelta(minutes=15)
+    coin = str(call_row.get("coin"))
+    call_time = as_utc_ts(call_row.get("call_time"))
+    if pd.isna(call_time):
+        return dict(call_row)
 
+    # fetch from just before call_time to now
+    start = call_time - pd.Timedelta(minutes=15)
     df = fetch_candles(coin, to_ms(start.to_pydatetime()), to_ms(end))
     if df.empty:
         return dict(call_row)
@@ -326,36 +282,98 @@ def update_call_status(call_row: pd.Series, end: datetime) -> Dict[str, Any]:
     if df.empty:
         return dict(call_row)
 
-    tp_price = float(call_row["tp_price"])
-    sl_price = float(call_row["sl_price"])
-    call_price = float(call_row["call_price"])
-    expiry_time = pd.to_datetime(call_row["expiry_time"], utc=True)
+    tp_price = safe_float(call_row.get("tp_price"))
+    sl_price = safe_float(call_row.get("sl_price"))
+    call_price = safe_float(call_row.get("call_price"))
+    expiry_time = as_utc_ts(call_row.get("expiry_time"))
 
-    hit_tp = (df["high"] >= tp_price).any()
-    hit_sl = (df["low"] <= sl_price).any()
+    if not np.isfinite(call_price) or call_price <= 0:
+        return dict(call_row)
 
-    status = "OPEN"
+    hit_tp = np.isfinite(tp_price) and (df["high"] >= tp_price).any()
+    hit_sl = np.isfinite(sl_price) and (df["low"] <= sl_price).any()
+
+    status = str(call_row.get("status", "OPEN"))
+    if status != "OPEN":
+        # already closed -> keep static (archived)
+        return dict(call_row)
+
+    # conservative: SL first
+    new_status = "OPEN"
     if hit_sl:
-        status = "SL"
-        last_price = float(sl_price)
+        new_status = "SL"
+        last_price = float(sl_price) if np.isfinite(sl_price) else float(df["close"].iloc[-1])
     elif hit_tp:
-        status = "TP"
-        last_price = float(tp_price)
-    elif datetime.now(timezone.utc) >= expiry_time.to_pydatetime():
-        status = "EXPIRED"
+        new_status = "TP"
+        last_price = float(tp_price) if np.isfinite(tp_price) else float(df["close"].iloc[-1])
+    elif (not pd.isna(expiry_time)) and (end >= expiry_time.to_pydatetime()):
+        new_status = "EXPIRED"
         last_price = float(df["close"].iloc[-1])
     else:
-        status = "OPEN"
+        # still open: mark-to-market on last close
         last_price = float(df["close"].iloc[-1])
 
     pnl_pct = (last_price / call_price - 1.0) * 100.0
 
     updated = dict(call_row)
-    updated["status"] = status
+    updated["status"] = new_status
     updated["last_price"] = last_price
     updated["pnl_pct"] = pnl_pct
     return updated
 
+# =========================
+# DB ops
+# =========================
+def db_upsert_calls(sb: Client, rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+
+    payload = []
+    for r in rows:
+        payload.append({
+            "call_time": as_utc_ts(r["call_time"]).isoformat(),
+            "detected_time": as_utc_ts(r["detected_time"]).isoformat(),
+            "coin": str(r["coin"]),
+            "call_price": float(r["call_price"]),
+            "tp_price": float(r["tp_price"]),
+            "sl_price": float(r["sl_price"]),
+            "expiry_time": as_utc_ts(r["expiry_time"]).isoformat(),
+            "dump_pct": float(r["dump_pct"]),
+            "vol_z": float(r["vol_z"]),
+            "vol_ratio": float(r["vol_ratio"]),
+            "liq_ratio": float(r["liq_ratio"]),
+            "chance_pct": float(r["chance_pct"]),
+            "status": str(r["status"]),
+            "last_price": float(r["last_price"]),
+            "pnl_pct": float(r["pnl_pct"]),
+        })
+
+    sb.table("calls").upsert(payload, on_conflict="coin,call_time").execute()
+    return len(payload)
+
+def db_read_calls(sb: Client, limit: int = 5000) -> pd.DataFrame:
+    res = sb.table("calls").select("*").order("detected_time", desc=True).limit(int(limit)).execute()
+    data = getattr(res, "data", None) or []
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+
+    df["call_time"] = pd.to_datetime(df["call_time"], utc=True, errors="coerce")
+    df["expiry_time"] = pd.to_datetime(df["expiry_time"], utc=True, errors="coerce")
+    df["detected_time"] = pd.to_datetime(df.get("detected_time", df["call_time"]), utc=True, errors="coerce")
+    return df
+
+def db_update_call(sb: Client, coin: str, call_time: pd.Timestamp, status: str, last_price: float, pnl_pct: float):
+    # update exact position row
+    sb.table("calls").update({
+        "status": str(status),
+        "last_price": float(last_price),
+        "pnl_pct": float(pnl_pct),
+    }).eq("coin", str(coin)).eq("call_time", as_utc_ts(call_time).isoformat()).execute()
+
+# =========================
+# PnL simulation
+# =========================
 def simulate_pnl(calls: pd.DataFrame, start_equity: float, notional_per_trade: float, apply_friction: bool) -> Dict[str, Any]:
     if calls.empty:
         return {"equity": start_equity, "pnl": 0.0, "pnl_pct": 0.0, "open_count": 0, "closed_count": 0}
@@ -373,20 +391,18 @@ def simulate_pnl(calls: pd.DataFrame, start_equity: float, notional_per_trade: f
     open_ = 0
 
     for _, r in df.iterrows():
-        entry = float(r["call_price"])
-        # last_price may be NULL for very early rows; handle
-        try:
-            lastp = float(r["last_price"])
-        except Exception:
-            lastp = entry
+        entry = safe_float(r.get("call_price"))
+        lastp = safe_float(r.get("last_price"))
+        status = str(r.get("status", "OPEN"))
 
-        status = str(r["status"])
+        if not np.isfinite(entry) or entry <= 0:
+            continue
 
         if status == "TP":
-            exitp = float(r["tp_price"])
+            exitp = safe_float(r.get("tp_price"), lastp)
             closed += 1
         elif status == "SL":
-            exitp = float(r["sl_price"])
+            exitp = safe_float(r.get("sl_price"), lastp)
             closed += 1
         elif status == "EXPIRED":
             exitp = lastp
@@ -394,6 +410,9 @@ def simulate_pnl(calls: pd.DataFrame, start_equity: float, notional_per_trade: f
         else:
             exitp = lastp
             open_ += 1
+
+        if not np.isfinite(exitp) or exitp <= 0:
+            continue
 
         ret = (exitp / entry) - 1.0
         ret -= friction_rt
