@@ -120,6 +120,12 @@ REQUEST_MIN_DELAY = 0.30
 MAX_RETRIES = 6
 
 def hl_post(payload: Dict[str, Any]) -> Any:
+    """
+    HL POST with:
+    - rate limiting
+    - retry/backoff
+    - DEBUG info on failures (status, snippet)
+    """
     global _last_call_ts
     now = time.time()
     wait = REQUEST_MIN_DELAY - (now - _last_call_ts)
@@ -127,16 +133,28 @@ def hl_post(payload: Dict[str, Any]) -> Any:
         time.sleep(wait)
 
     backoff = 0.7
-    for _ in range(MAX_RETRIES):
+    last_err = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = SESSION.post(HL_INFO_URL, json=payload, timeout=20)
 
-            if r.status_code == 429:
+            # store info for debug
+            status = r.status_code
+            text_snip = ""
+            try:
+                text_snip = (r.text or "")[:180]
+            except Exception:
+                pass
+
+            if status == 429:
+                last_err = f"HTTP 429 rate-limited. snip={text_snip}"
                 time.sleep(backoff + random.uniform(0, 0.4))
                 backoff = min(backoff * 1.7, 10.0)
                 continue
 
-            if r.status_code in (500, 502, 503, 504):
+            if status in (500, 502, 503, 504):
+                last_err = f"HTTP {status} server error. snip={text_snip}"
                 time.sleep(backoff + random.uniform(0, 0.4))
                 backoff = min(backoff * 1.7, 10.0)
                 continue
@@ -145,11 +163,18 @@ def hl_post(payload: Dict[str, Any]) -> Any:
             _last_call_ts = time.time()
             return r.json()
 
-        except requests.RequestException:
+        except requests.Timeout:
+            last_err = "Timeout"
             time.sleep(backoff + random.uniform(0, 0.4))
             backoff = min(backoff * 1.7, 10.0)
 
-    raise RuntimeError("HL request failed after retries")
+        except requests.RequestException as e:
+            last_err = f"RequestException: {type(e).__name__}: {str(e)[:140]}"
+            time.sleep(backoff + random.uniform(0, 0.4))
+            backoff = min(backoff * 1.7, 10.0)
+
+    raise RuntimeError(f"HL request failed after retries. last_err={last_err}")
+
 
 def fetch_hl_universe() -> List[str]:
     meta = hl_post({"type": "meta"})
