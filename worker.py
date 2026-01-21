@@ -3,202 +3,247 @@ import time
 import traceback
 import pandas as pd
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from shared import (
     supabase_client_env,
     load_sweetspot,
     fetch_hl_universe,
-    build_macro_series,
-    analyze_coin_for_scan,
+    fetch_candles,
+    build_btc_vol_z,
+    detect_call_for_coin,
+    update_call_status,
     db_upsert_calls,
     db_read_calls,
-    update_call_status,
     db_update_call,
+    db_upsert_latest_scan,
+    db_upsert_heartbeat,
+    ensure_utc_ts,
+    utc_now,
+    to_ms,
+    VOL_WIN,
+    DROP_MIN,
+    DROP_MAX,
+    VOL_Z_MAX,
+    VOL_SPIKE_MULT,
+    VOL_FLOOR_MULT,
 )
 
-WORKER_VERSION = "v2026-01-21-diagnostics"
+VERSION_TAG = "v2026-01-21-diagnostics-fix"
 
-HEARTBEAT_NAME = "scanner"
-SCAN_SLEEP_SECONDS = int(os.getenv("WORKER_SLEEP_SECONDS", "60"))
+WORKER_SLEEP_SECONDS = int(os.getenv("WORKER_SLEEP_SECONDS", "60"))
 STATUS_UPDATE_TOP_N = int(os.getenv("STATUS_UPDATE_TOP_N", "120"))
-UPDATE_OPEN_LOOKBACK_HOURS = int(os.getenv("UPDATE_OPEN_LOOKBACK_HOURS", "24"))
-HEARTBEAT_PROGRESS_EVERY = int(os.getenv("HEARTBEAT_PROGRESS_EVERY", "10"))
 
-SCAN_ONLY_ON_NEW_15M_BAR = os.getenv("SCAN_ONLY_ON_NEW_15M_BAR", "1") == "1"
-STATUS_UPDATE_EVERY_N_SCANS = int(os.getenv("STATUS_UPDATE_EVERY_N_SCANS", "3"))
+def _log(msg: str):
+    print(msg, flush=True)
 
-def hb(sb, note: str):
-    sb.table("worker_heartbeat").upsert(
-        {
-            "name": HEARTBEAT_NAME,
-            "last_seen": datetime.now(timezone.utc).isoformat(),
-            "note": f"{WORKER_VERSION} | {note}",
-        },
-        on_conflict="name",
-    ).execute()
-    print(f"[hb] {WORKER_VERSION} | {note}", flush=True)
+def _warn(msg: str):
+    print(msg, flush=True)
 
-def upsert_scan_snapshots(sb, rows: List[Dict[str, Any]]) -> int:
-    if not rows:
-        return 0
-    sb.table("scan_snapshots").upsert(rows, on_conflict="coin,bar_time").execute()
-    return len(rows)
+def compute_latest_scan_row(
+    coin: str,
+    base_wr: float,
+    btc_z: Optional[float],
+    macro_df: Optional[pd.DataFrame],
+    end: datetime,
+) -> Dict[str, Any]:
+    """
+    For UI table: compute latest bar metrics + gate-lights.
+    Uses short candle range (~10h).
+    """
+    end = end.astimezone(timezone.utc)
+    start = end - timedelta(hours=10)
+
+    row: Dict[str, Any] = {
+        "coin": coin,
+        "bar_close_utc": ensure_utc_ts(end),  # will be overwritten with candle timestamp
+        "updated_time_utc": ensure_utc_ts(end),
+        "price": None,
+        "chg_15m_pct": None,
+        "dump_pct": None,
+        "vol_ratio": None,
+        "btc_vol_z": None if btc_z is None else float(btc_z),
+        "gate_dump": False,
+        "gate_macro": False,
+        "gate_spike": False,
+        "gate_floor": False,
+        "signal": False,
+        "err": None,
+    }
+
+    try:
+        df = fetch_candles(coin, to_ms(start), to_ms(end + timedelta(seconds=1)))
+        if df.empty or len(df) < (VOL_WIN + 2):
+            row["err"] = "too_few_candles"
+            return row
+
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        bar_close = ensure_utc_ts(last["timestamp"])
+        row["bar_close_utc"] = bar_close
+
+        price = float(last["close"])
+        row["price"] = price
+
+        # 15m change: close vs prev close (mer stabilt i UI)
+        prev_close = float(prev["close"])
+        chg_15m = (price / prev_close - 1.0) * 100.0
+        row["chg_15m_pct"] = float(chg_15m)
+
+        # dump wick open->low (samma som signal)
+        dump = float((float(last["open"]) - float(last["low"])) / float(last["open"])) * 100.0
+        row["dump_pct"] = dump
+
+        medv = df["volume"].rolling(VOL_WIN).median().iloc[-1]
+        if medv and float(medv) > 0:
+            vol_ratio = float(last["volume"]) / float(medv)
+            row["vol_ratio"] = float(vol_ratio)
+        else:
+            row["vol_ratio"] = None
+
+        # gates
+        dump_ok = (dump/100.0 >= DROP_MIN) and (dump/100.0 <= DROP_MAX)
+        macro_ok = (btc_z is not None) and (abs(float(btc_z)) <= VOL_Z_MAX)
+        spike_ok = (row["vol_ratio"] is not None) and (float(row["vol_ratio"]) >= VOL_SPIKE_MULT)
+        floor_ok = (row["vol_ratio"] is not None) and (float(row["vol_ratio"]) >= VOL_FLOOR_MULT)
+
+        row["gate_dump"] = bool(dump_ok)
+        row["gate_macro"] = bool(macro_ok)
+        row["gate_spike"] = bool(spike_ok)
+        row["gate_floor"] = bool(floor_ok)
+        row["signal"] = bool(dump_ok and macro_ok and spike_ok and floor_ok)
+
+        return row
+
+    except Exception as e:
+        row["err"] = str(e)[:240]
+        return row
 
 def main():
     sb = supabase_client_env()
-    hb(sb, "BOOT: started")
 
+    _log(f"[hb] {VERSION_TAG} | BOOT: started")
+
+    # sweetspot
     sweet = load_sweetspot()
     sweet["coin"] = sweet["coin"].astype(str)
+    sweet_map = {str(r["coin"]): float(r.get("winrate", 0.55)) for _, r in sweet.iterrows()}
+    sweet_coins = list(sweet_map.keys())
 
-    coins_all = sweet["coin"].tolist()
-    hb(sb, f"Loaded sweetspot coins: {len(coins_all)}")
+    _log(f"[hb] {VERSION_TAG} | Loaded sweetspot coins: {len(sweet_coins)}")
 
-    # keep only coins that exist on HL
-    try:
-        uni = set(fetch_hl_universe())
-        coins = [c for c in coins_all if c in uni]
-        hb(sb, f"HL universe ok. sweetspot_on_hl={len(coins)} / sweetspot_total={len(coins_all)}")
-    except Exception as e:
-        coins = coins_all
-        hb(sb, f"WARN HL universe check failed: {type(e).__name__}: {str(e)[:120]}")
+    # intersect with HL universe (avoid scanning coins not on HL)
+    hl_uni = fetch_hl_universe()
+    hl_set = set(hl_uni)
+    coins = [c for c in sweet_coins if c in hl_set]
 
-    last_bar_ts = None
-    scan_count = 0
+    _log(f"[hb] {VERSION_TAG} | HL universe ok. sweetspot_on_hl={len(coins)}")
 
     while True:
-        loop_start = datetime.now(timezone.utc)
-        scanned = 0
+        loop_start = utc_now()
         found = 0
-        calls_upserted = 0
-        snaps_upserted = 0
+        upserted = 0
 
         try:
-            hb(sb, "LOOP: start")
+            _log(f"[loop] start {loop_start.isoformat()}")
 
-            macro = build_macro_series(loop_start)
-            if macro is None or macro.empty:
-                hb(sb, "macro empty -> sleep")
-                time.sleep(SCAN_SLEEP_SECONDS)
-                continue
+            # BTC macro
+            btc_z, macro_df = build_btc_vol_z(loop_start)
+            if macro_df is None:
+                _warn("[macro][WARN] BTC macro missing (HL may be rate-limiting).")
+                macro_df = pd.DataFrame(columns=["timestamp","vol_z"])
 
-            # only scan when macro has a new 15m bar
-            if SCAN_ONLY_ON_NEW_15M_BAR:
-                try:
-                    current_bar_ts = pd.to_datetime(macro["timestamp"].iloc[-1], utc=True)
-                except Exception:
-                    current_bar_ts = None
+            scan_rows: List[Dict[str, Any]] = []
+            new_calls: List[Dict[str, Any]] = []
 
-                if current_bar_ts is not None and last_bar_ts is not None and current_bar_ts <= last_bar_ts:
-                    hb(sb, "no new 15m bar -> skip")
-                    time.sleep(SCAN_SLEEP_SECONDS)
-                    continue
-
-                last_bar_ts = current_bar_ts
-                hb(sb, f"new 15m bar -> scan ({last_bar_ts.isoformat() if last_bar_ts is not None else 'na'})")
-
-            scan_count += 1
-
-            snapshots = []
-            new_calls = []
-
+            total = len(coins)
             for i, coin in enumerate(coins, start=1):
-                scanned += 1
-                if i % HEARTBEAT_PROGRESS_EVERY == 0:
-                    hb(sb, f"progress {i}/{len(coins)}")
+                base_wr = float(sweet_map.get(coin, 0.55))
 
-                base_wr = 0.55
-                try:
-                    w = sweet.loc[sweet["coin"] == coin, "winrate"]
-                    if len(w) > 0:
-                        base_wr = float(w.iloc[0])
-                except Exception:
-                    pass
+                # UI row
+                scan_row = compute_latest_scan_row(
+                    coin=coin,
+                    base_wr=base_wr,
+                    btc_z=btc_z,
+                    macro_df=macro_df,
+                    end=loop_start,
+                )
+                scan_rows.append(scan_row)
 
+                # signal -> insert call using full detect (still optimized)
                 try:
-                    snap, call = analyze_coin_for_scan(
-                        coin=coin,
-                        macro=macro,
-                        base_wr=base_wr,
-                        end=loop_start,
-                        detected_time=loop_start,
-                    )
-                    if snap:
-                        snapshots.append(snap)
-                    if call:
-                        new_calls.append(call)
-                        found += 1
+                    if macro_df is not None and not macro_df.empty:
+                        call = detect_call_for_coin(
+                            coin=coin,
+                            macro=macro_df,
+                            base_wr=base_wr,
+                            end=loop_start,
+                            detected_time=loop_start,
+                        )
+                        if call:
+                            new_calls.append(call)
+                            found += 1
                 except Exception as e:
-                    # keep going, don’t crash whole scan
-                    print(f"[scan][WARN] {coin} failed: {e}", flush=True)
+                    _warn(f"[scan][WARN] {coin} detect failed: {e}")
 
-            # write snapshots & calls
+                if i % 10 == 0 or i == total:
+                    _log(f"[hb] {VERSION_TAG} | progress {i}/{total}")
+
+            # write latest_scan snapshot
             try:
-                snaps_upserted = upsert_scan_snapshots(sb, snapshots)
+                db_upsert_latest_scan(sb, scan_rows)
             except Exception as e:
-                hb(sb, f"ERROR upsert snapshots: {type(e).__name__}: {str(e)[:120]}")
-                print("[ERROR] upsert snapshots failed:", e, flush=True)
+                _warn(f"[latest_scan][WARN] upsert failed: {e}")
 
+            # upsert new calls
             if new_calls:
                 try:
-                    calls_upserted = db_upsert_calls(sb, new_calls)
+                    upserted = db_upsert_calls(sb, new_calls)
                 except Exception as e:
-                    hb(sb, f"ERROR upsert calls: {type(e).__name__}: {str(e)[:120]}")
-                    print("[ERROR] upsert calls failed:", e, flush=True)
+                    _warn(f"[calls][WARN] upsert failed: {e}")
 
-            # status update less often
-            if scan_count % STATUS_UPDATE_EVERY_N_SCANS == 0:
-                try:
-                    calls_df = db_read_calls(sb, limit=4000)
-                    if not calls_df.empty:
-                        cutoff = loop_start - timedelta(hours=UPDATE_OPEN_LOOKBACK_HOURS)
-                        open_df = calls_df[(calls_df["call_time"] >= cutoff) & (calls_df["status"] == "OPEN")].copy()
-                        if not open_df.empty:
-                            open_df = open_df.sort_values("call_time", ascending=False).head(STATUS_UPDATE_TOP_N)
+            # status update (OPEN only)
+            try:
+                calls = db_read_calls(sb, limit=5000)
+                if not calls.empty:
+                    calls = calls.sort_values("detected_time", ascending=False)
+                    open_calls = calls[calls["status"].astype(str) == "OPEN"].head(STATUS_UPDATE_TOP_N)
 
-                        for _, row in open_df.iterrows():
-                            try:
-                                upd = update_call_status(row, end=loop_start)
-                                # null-safe
-                                new_status = str(upd.get("status", row.get("status")))
-                                new_last = float(upd.get("last_price", row.get("last_price") or row.get("call_price") or 0.0))
-                                new_pnl = float(upd.get("pnl_pct", row.get("pnl_pct") or 0.0))
+                    for _, r in open_calls.iterrows():
+                        try:
+                            upd = update_call_status(r, loop_start)
+                            if (upd["status"] != r["status"]) or (abs(float(upd["pnl_pct"]) - float(r["pnl_pct"])) > 0.01):
+                                db_update_call(
+                                    sb,
+                                    coin=str(r["coin"]),
+                                    call_time=ensure_utc_ts(r["call_time"]),
+                                    status=str(upd["status"]),
+                                    last_price=float(upd["last_price"]),
+                                    pnl_pct=float(upd["pnl_pct"]),
+                                )
+                        except Exception as e:
+                            _warn(f"[status][WARN] {r.get('coin')} update failed: {e}")
+            except Exception as e:
+                _warn(f"[status][WARN] batch failed: {e}")
 
-                                if (
-                                    new_status != str(row.get("status"))
-                                    or abs(new_last - float(row.get("last_price") or 0.0)) > 1e-12
-                                    or abs(new_pnl - float(row.get("pnl_pct") or 0.0)) > 1e-12
-                                ):
-                                    db_update_call(
-                                        sb=sb,
-                                        coin=str(row["coin"]),
-                                        call_time=pd.to_datetime(row["call_time"], utc=True),
-                                        status=new_status,
-                                        last_price=new_last,
-                                        pnl_pct=new_pnl,
-                                    )
-                            except Exception as e:
-                                print("[status][WARN]", e, flush=True)
-                except Exception as e:
-                    hb(sb, f"ERROR status: {type(e).__name__}: {str(e)[:120]}")
-                    print("[ERROR] status update failed:", e, flush=True)
+            dt = (utc_now() - loop_start).total_seconds()
+            note = f"LOOP: done {dt:.1f}s | scanned={len(coins)} found={found} upserted={upserted}"
+            db_upsert_heartbeat(sb, name="scanner", note=note)
 
-            dur = (datetime.now(timezone.utc) - loop_start).total_seconds()
-            hb(sb, f"done {dur:.1f}s | scanned={scanned} found={found} calls_upserted={calls_upserted} snaps_upserted={snaps_upserted}")
-            print(f"[loop] done {dur:.1f}s | scanned={scanned} found={found} calls={calls_upserted} snaps={snaps_upserted} -> sleep {SCAN_SLEEP_SECONDS}s", flush=True)
-
-            time.sleep(SCAN_SLEEP_SECONDS)
+            _log(f"[loop] {note} -> sleep {WORKER_SLEEP_SECONDS}s")
+            time.sleep(WORKER_SLEEP_SECONDS)
 
         except Exception as e:
-            msg = f"{type(e).__name__}: {str(e)[:140]}"
+            err = f"CRASH: {e}"
+            _warn(f"[fatal] {err}")
+            _warn(traceback.format_exc())
             try:
-                hb(sb, f"FATAL loop: {msg}")
+                db_upsert_heartbeat(sb, name="scanner", note=err)
             except Exception:
                 pass
-            print("[FATAL] loop crashed:", msg, flush=True)
-            traceback.print_exc()
-            time.sleep(60)
+            time.sleep(max(10, WORKER_SLEEP_SECONDS))
 
 if __name__ == "__main__":
     main()
