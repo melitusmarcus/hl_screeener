@@ -1,396 +1,179 @@
 ﻿import os
 import time
-import random
-import requests
-import numpy as np
+import traceback
 import pandas as pd
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List, Optional
 
-from supabase import create_client, Client
+from shared import (
+    supabase_client_env,
+    load_sweetspot,
+    fetch_hl_universe,
+    build_macro_series,
+    detect_call_for_coin,
+    db_upsert_calls,
+    db_read_calls,
+    update_call_status,
+    db_update_call,
+)
 
-HL_INFO_URL = "https://api.hyperliquid.xyz/info"
+WORKER_VERSION = "v2026-01-21-crashsafe"
 
-# =========================
-# CONFIG (shared)
-# =========================
-INTERVAL = "15m"  # HL candle interval
+HEARTBEAT_NAME = "scanner"
+SCAN_SLEEP_SECONDS = int(os.getenv("WORKER_SLEEP_SECONDS", "60"))
+STATUS_UPDATE_TOP_N = int(os.getenv("STATUS_UPDATE_TOP_N", "120"))
+UPDATE_OPEN_LOOKBACK_HOURS = int(os.getenv("UPDATE_OPEN_LOOKBACK_HOURS", "24"))
+HEARTBEAT_PROGRESS_EVERY = int(os.getenv("HEARTBEAT_PROGRESS_EVERY", "10"))
 
-# Dump gate (long-bounce)
-DROP_MIN = 0.005
-DROP_MAX = 0.05
+def hb(sb, note: str):
+    sb.table("worker_heartbeat").upsert(
+        {
+            "name": HEARTBEAT_NAME,
+            "last_seen": datetime.now(timezone.utc).isoformat(),
+            "note": f"{WORKER_VERSION} | {note}",
+        },
+        on_conflict="name",
+    ).execute()
+    print(f"[hb] {WORKER_VERSION} | {note}", flush=True)
 
-VOL_WIN = 20
-VOL_Z_MAX = 0.60
-VOL_SPIKE_MULT = 2.00
-VOL_FLOOR_MULT = 1.20
+def main():
+    sb = supabase_client_env()
+    hb(sb, "BOOT: started")
 
-TP = 0.015
-SL = 0.020
-HOLD_BARS = 24  # 24 * 15m = 6h
+    # Load sweetspot
+    sweet = load_sweetspot()
+    sweet["coin"] = sweet["coin"].astype(str)
+    coins = sweet["coin"].tolist()
+    hb(sb, f"Loaded sweetspot coins: {len(coins)}")
 
-FEE_PER_SIDE = 0.00045
-SLIP_PER_SIDE = 0.00030
+    # Validate HL universe once
+    try:
+        uni = set(fetch_hl_universe())
+        coins = [c for c in coins if c in uni]
+        hb(sb, f"HL universe ok. sweetspot_on_hl={len(coins)}")
+    except Exception as e:
+        hb(sb, f"WARN HL universe check failed: {type(e).__name__}: {str(e)[:120]}")
 
-SWEETSPOT_PATH = "sweetspot_coins.csv"
+    while True:
+        loop_start = datetime.now(timezone.utc)
+        scanned = 0
+        found = 0
+        upserted = 0
 
-# =========================
-# Supabase (ENV only)
-# =========================
-def supabase_client_env() -> Client:
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_KEY")
-    if not url or not key:
-        raise RuntimeError("Missing SUPABASE_URL / SUPABASE_SERVICE_KEY env vars.")
-    return create_client(url, key)
-
-def db_upsert_calls(sb: Client, rows: List[Dict[str, Any]]) -> int:
-    """
-    Upsert rows into public.calls. Expects NOT NULL columns to be present.
-    """
-    if not rows:
-        return 0
-
-    payload = []
-    for r in rows:
-        # Defensive defaults to avoid None -> NOT NULL errors
-        call_time = r.get("call_time")
-        detected_time = r.get("detected_time") or call_time
-        expiry_time = r.get("expiry_time")
-
-        call_price = r.get("call_price")
-        tp_price = r.get("tp_price")
-        sl_price = r.get("sl_price")
-
-        last_price = r.get("last_price", call_price)
-        pnl_pct = r.get("pnl_pct", 0.0)
-
-        payload.append({
-            "call_time": pd.to_datetime(call_time, utc=True).isoformat() if call_time is not None else None,
-            "detected_time": pd.to_datetime(detected_time, utc=True).isoformat() if detected_time is not None else None,
-            "coin": str(r.get("coin")),
-            "call_price": float(call_price) if call_price is not None else 0.0,
-            "tp_price": float(tp_price) if tp_price is not None else 0.0,
-            "sl_price": float(sl_price) if sl_price is not None else 0.0,
-            "expiry_time": pd.to_datetime(expiry_time, utc=True).isoformat() if expiry_time is not None else None,
-            "dump_pct": float(r.get("dump_pct", 0.0)),
-            "vol_z": float(r.get("vol_z", 0.0)),
-            "vol_ratio": float(r.get("vol_ratio", 0.0)),
-            "liq_ratio": float(r.get("liq_ratio", 0.0)),
-            "chance_pct": float(r.get("chance_pct", 50.0)),
-            "status": str(r.get("status", "OPEN")),
-            "last_price": float(last_price) if last_price is not None else float(call_price or 0.0),
-            "pnl_pct": float(pnl_pct) if pnl_pct is not None else 0.0,
-        })
-
-    sb.table("calls").upsert(payload, on_conflict="coin,call_time").execute()
-    return len(payload)
-
-def db_read_calls(sb: Client, limit: int = 5000) -> pd.DataFrame:
-    res = sb.table("calls").select("*").order("detected_time", desc=True).limit(int(limit)).execute()
-    data = getattr(res, "data", None) or []
-    df = pd.DataFrame(data)
-    if df.empty:
-        return df
-
-    df["call_time"] = pd.to_datetime(df["call_time"], utc=True, errors="coerce")
-    df["expiry_time"] = pd.to_datetime(df["expiry_time"], utc=True, errors="coerce")
-    df["detected_time"] = pd.to_datetime(df.get("detected_time", df["call_time"]), utc=True, errors="coerce")
-    return df
-
-def db_update_call(sb: Client, coin: str, call_time: pd.Timestamp, status: str, last_price: float, pnl_pct: float):
-    sb.table("calls").update({
-        "status": str(status),
-        "last_price": float(last_price),
-        "pnl_pct": float(pnl_pct),
-    }).eq("coin", str(coin)).eq("call_time", pd.to_datetime(call_time, utc=True).isoformat()).execute()
-
-# =========================
-# HL client (rate-limited)
-# =========================
-SESSION = requests.Session()
-_last_call_ts = 0.0
-REQUEST_MIN_DELAY = 0.20
-MAX_RETRIES = 8
-
-def hl_post(payload: Dict[str, Any]) -> Any:
-    global _last_call_ts
-    now = time.time()
-    wait = REQUEST_MIN_DELAY - (now - _last_call_ts)
-    if wait > 0:
-        time.sleep(wait)
-
-    backoff = 0.6
-    for _ in range(MAX_RETRIES):
         try:
-            r = SESSION.post(HL_INFO_URL, json=payload, timeout=20)
+            hb(sb, "LOOP: start")
 
-            if r.status_code == 429:
-                time.sleep(backoff + random.uniform(0, 0.4))
-                backoff = min(backoff * 1.7, 10.0)
+            macro = build_macro_series(loop_start)
+            if macro is None or macro.empty:
+                hb(sb, "macro empty -> sleep")
+                time.sleep(SCAN_SLEEP_SECONDS)
                 continue
 
-            if r.status_code in (500, 502, 503, 504):
-                time.sleep(backoff + random.uniform(0,  0.4))
-                backoff = min(backoff * 1.7, 10.0)
-                continue
+            new_rows = []
+            for i, coin in enumerate(coins, start=1):
+                scanned += 1
+                if i % HEARTBEAT_PROGRESS_EVERY == 0:
+                    hb(sb, f"progress {i}/{len(coins)}")
 
-            r.raise_for_status()
-            _last_call_ts = time.time()
-            return r.json()
+                base_wr = 0.55
+                try:
+                    wr = sweet.loc[sweet["coin"] == coin, "winrate"]
+                    if len(wr) > 0:
+                        base_wr = float(wr.iloc[0])
+                except Exception:
+                    pass
 
-        except requests.RequestException:
-            time.sleep(backoff + random.uniform(0, 0.4))
-            backoff = min(backoff * 1.7, 10.0)
+                try:
+                    call = detect_call_for_coin(
+                        coin=coin,
+                        macro=macro,
+                        base_wr=base_wr,
+                        end=loop_start,
+                        detected_time=loop_start,
+                    )
+                except Exception as e:
+                    print(f"[scan][WARN] {coin} detect failed: {e}", flush=True)
+                    continue
 
-    raise RuntimeError("HL request failed after retries")
+                if call is not None:
+                    new_rows.append(call)
+                    found += 1
 
-def to_ms(dt: datetime) -> int:
-    return int(dt.timestamp() * 1000)
+            if new_rows:
+                try:
+                    upserted = db_upsert_calls(sb, new_rows)
+                except Exception as e:
+                    hb(sb, f"ERROR upsert: {type(e).__name__}: {str(e)[:120]}")
+                    print("[ERROR] upsert failed:", e, flush=True)
+                    upserted = 0
 
-def fetch_candles(coin: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-    data = hl_post({
-        "type": "candleSnapshot",
-        "req": {"coin": coin, "interval": INTERVAL, "startTime": start_ms, "endTime": end_ms}
-    })
-    if not data:
-        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+            # Update statuses for recent OPEN calls
+            try:
+                calls_df = db_read_calls(sb, limit=4000)
+                if not calls_df.empty:
+                    cutoff = loop_start - timedelta(hours=UPDATE_OPEN_LOOKBACK_HOURS)
+                    open_df = calls_df[(calls_df["call_time"] >= cutoff) & (calls_df["status"] == "OPEN")].copy()
+                    if not open_df.empty:
+                        open_df = open_df.sort_values("call_time", ascending=False).head(STATUS_UPDATE_TOP_N)
 
-    df = pd.DataFrame(data)
-    if "t" not in df.columns:
-        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+                    updated = 0
+                    for _, row in open_df.iterrows():
+                        try:
+                            upd = update_call_status(row, end=loop_start)
+                            if (
+                                str(upd.get("status")) != str(row.get("status"))
+                                or float(upd.get("pnl_pct", 0.0)) != float(row.get("pnl_pct", 0.0))
+                                or float(upd.get("last_price", 0.0)) != float(row.get("last_price", 0.0))
+                            ):
+                                db_update_call(
+                                    sb=sb,
+                                    coin=str(row["coin"]),
+                                    call_time=pd.to_datetime(row["call_time"], utc=True),
+                                    status=str(upd.get("status", row.get("status"))),
+                                    last_price=float(upd.get("last_price", row.get("last_price") or 0.0)),
+                                    pnl_pct=float(upd.get("pnl_pct", row.get("pnl_pct") or 0.0)),
+                                )
+                                updated += 1
+                        except Exception as e:
+                            print("[status][WARN]", e, flush=True)
 
-    df["timestamp"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    for src, dst in [("o","open"),("h","high"),("l","low"),("c","close"),("v","volume")]:
-        df[dst] = pd.to_numeric(df.get(src), errors="coerce")
+                    if updated:
+                        print(f"[status] updated_open={updated}", flush=True)
 
-    df = df[["timestamp","open","high","low","close","volume"]].dropna()
-    df = df.sort_values("timestamp").drop_duplicates("timestamp")
-    return df
+            except Exception as e:
+                hb(sb, f"ERROR status: {type(e).__name__}: {str(e)[:120]}")
+                print("[ERROR] status update failed:", e, flush=True)
 
-def load_sweetspot() -> pd.DataFrame:
-    df = pd.read_csv(SWEETSPOT_PATH)
-    df["coin"] = df["coin"].astype(str).str.upper().str.strip()
-    if "winrate" not in df.columns:
-        df["winrate"] = 0.55
-    return df
+            dur = (datetime.now(timezone.utc) - loop_start).total_seconds()
+            hb(sb, f"done {dur:.1f}s | scanned={scanned} found={found} upserted={upserted}")
+            print(f"[loop] done {dur:.1f}s | scanned={scanned} found={found} upserted={upserted} -> sleep {SCAN_SLEEP_SECONDS}s", flush=True)
+            time.sleep(SCAN_SLEEP_SECONDS)
 
-# =========================
-# Chance heuristic
-# =========================
-def compute_chance_pct(base_wr: float, dump_pct: float, vol_z: float, vol_ratio: float, liq_ratio: float) -> float:
-    wr = float(np.clip(base_wr, 0.35, 0.80))
-    score = (wr - 0.50)
+        except Exception as e:
+            # NEVER die; report and sleep
+            msg = f"{type(e).__name__}: {str(e)[:140]}"
+            try:
+                hb(sb, f"FATAL loop: {msg}")
+            except Exception:
+                pass
+            print("[FATAL] loop crashed:", msg, flush=True)
+            traceback.print_exc()
+            time.sleep(60)
 
-    dump_norm = np.clip((dump_pct - DROP_MIN) / (DROP_MAX - DROP_MIN), 0, 1)
-    score += 0.12 * dump_norm
-
-    vol_norm = np.clip((vol_ratio - VOL_SPIKE_MULT) / max(0.1, (4.0 - VOL_SPIKE_MULT)), 0, 1)
-    score += 0.10 * vol_norm
-
-    z_norm = np.clip(abs(vol_z) / max(0.01, VOL_Z_MAX), 0, 1)
-    score -= 0.10 * z_norm
-
-    liq_norm = np.clip((liq_ratio - VOL_FLOOR_MULT) / max(0.1, (2.0 - VOL_FLOOR_MULT)), 0, 1)
-    score += 0.04 * liq_norm
-
-    chance = 50 + score * 100
-    return float(np.clip(chance, 5, 95))
-
-# =========================
-# Macro series (BTC vol_z)
-# =========================
-def build_macro_series(end: datetime) -> pd.DataFrame:
-    start = end - timedelta(days=3)
-    btc = fetch_candles("BTC", to_ms(start), to_ms(end))
-    if btc.empty or len(btc) < 120:
-        return pd.DataFrame(columns=["timestamp","vol_z"])
-
-    ret = np.log(btc["close"]).diff()
-    rv = ret.rolling(40).std(ddof=0)
-    mu = rv.rolling(40).mean()
-    sd = rv.rolling(40).std(ddof=0)
-    vol_z = (rv - mu) / sd
-    out = pd.DataFrame({"timestamp": btc["timestamp"], "vol_z": vol_z}).dropna()
-    return out
-
-# =========================
-# Call detection (BACKWARD COMPAT)
-# =========================
-def detect_call_for_coin(
-    coin: str,
-    macro: pd.DataFrame,
-    base_wr: float,
-    end: datetime,
-    detected_time: datetime,
-    vol_z_max: float = VOL_Z_MAX,
-    vol_spike_mult: float = VOL_SPIKE_MULT,
-    vol_floor_mult: float = VOL_FLOOR_MULT,
-    drop_min: float = DROP_MIN,
-    drop_max: float = DROP_MAX,
-) -> Optional[Dict[str, Any]]:
-    """
-    Long-bounce signal:
-    - dump on candle: (open - low)/open in [drop_min, drop_max]
-    - macro calm: abs(BTC vol_z) <= vol_z_max
-    - volume spike: volume/median(volume, VOL_WIN) >= vol_spike_mult
-    - liquidity floor: volume/median(volume, VOL_WIN) >= vol_floor_mult
-    """
-    start = end - timedelta(days=3)
-    df = fetch_candles(coin, to_ms(start), to_ms(end))
-    if df.empty or len(df) < (VOL_WIN + 5):
-        return None
-
-    m = pd.merge(df, macro, on="timestamp", how="inner").dropna()
-    if m.empty or len(m) < (VOL_WIN + 5):
-        return None
-
-    m = m.reset_index(drop=True)
-    last = m.iloc[-1]
-
-    dump_pct = float((last["open"] - last["low"]) / last["open"])
-    vol_z = float(last["vol_z"])
-
-    medv = m["volume"].rolling(VOL_WIN).median().iloc[-1]
-    if not np.isfinite(medv) or medv <= 0:
-        return None
-
-    vol_ratio = float(last["volume"] / medv)
-    liq_ratio = float(last["volume"] / medv)
-
-    dump_ok = (dump_pct >= float(drop_min)) and (dump_pct <= float(drop_max))
-    macro_ok = (abs(vol_z) <= float(vol_z_max))
-    spike_ok = (vol_ratio >= float(vol_spike_mult))
-    floor_ok = (liq_ratio >= float(vol_floor_mult))
-
-    if not (dump_ok and macro_ok and spike_ok and floor_ok):
-        return None
-
-    call_price = float(last["close"])
-    call_time = pd.to_datetime(last["timestamp"], utc=True).to_pydatetime()
-    tp_price = call_price * (1 + TP)
-    sl_price = call_price * (1 - SL)
-    expiry_time = call_time + timedelta(minutes=15 * HOLD_BARS)
-
-    chance_pct = compute_chance_pct(
-        base_wr=float(base_wr),
-        dump_pct=float(dump_pct),
-        vol_z=float(vol_z),
-        vol_ratio=float(vol_ratio),
-        liq_ratio=float(liq_ratio),
-    )
-
-    return {
-        "call_time": pd.Timestamp(call_time, tz=timezone.utc),
-        "detected_time": pd.Timestamp(detected_time, tz=timezone.utc),
-        "coin": coin,
-        "call_price": call_price,
-        "tp_price": tp_price,
-        "sl_price": sl_price,
-        "expiry_time": pd.Timestamp(expiry_time, tz=timezone.utc),
-        "dump_pct": dump_pct * 100.0,
-        "vol_z": vol_z,
-        "vol_ratio": vol_ratio,
-        "liq_ratio": liq_ratio,
-        "chance_pct": chance_pct,
-        "status": "OPEN",
-        "last_price": call_price,
-        "pnl_pct": 0.0,
-    }
-
-# =========================
-# Status update
-# =========================
-def update_call_status(call_row: pd.Series, end: datetime) -> Dict[str, Any]:
-    coin = str(call_row["coin"])
-    call_time = pd.to_datetime(call_row["call_time"], utc=True)
-    start = call_time - timedelta(minutes=15)
-
-    df = fetch_candles(coin, to_ms(start.to_pydatetime()), to_ms(end))
-    if df.empty:
-        return dict(call_row)
-
-    df = df[df["timestamp"] >= call_time].copy()
-    if df.empty:
-        return dict(call_row)
-
-    tp_price = float(call_row["tp_price"])
-    sl_price = float(call_row["sl_price"])
-    call_price = float(call_row["call_price"])
-    expiry_time = pd.to_datetime(call_row["expiry_time"], utc=True)
-
-    hit_tp = (df["high"] >= tp_price).any()
-    hit_sl = (df["low"] <= sl_price).any()
-
-    status = "OPEN"
-    # conservative: SL first
-    if hit_sl:
-        status = "SL"
-    elif hit_tp:
-        status = "TP"
-    elif datetime.now(timezone.utc) >= expiry_time.to_pydatetime():
-        status = "EXPIRED"
-
-    last_price = float(df["close"].iloc[-1])
-    pnl_pct = (last_price / call_price - 1.0) * 100.0
-
-    updated = dict(call_row)
-    updated["status"] = status
-    updated["last_price"] = last_price
-    updated["pnl_pct"] = pnl_pct
-    return updated
-
-# =========================
-# PnL simulation (hardened)
-# =========================
-def simulate_pnl(calls: pd.DataFrame, start_equity: float, notional_per_trade: float, apply_friction: bool) -> Dict[str, Any]:
-    if calls.empty:
-        return {"equity": start_equity, "pnl": 0.0, "pnl_pct": 0.0, "open_count": 0, "closed_count": 0}
-
-    df = calls.copy()
-    df["call_time"] = pd.to_datetime(df["call_time"], utc=True, errors="coerce")
-    df = df.sort_values("call_time")
-
-    friction_rt = 0.0
-    if apply_friction:
-        friction_rt = 2.0 * (FEE_PER_SIDE + SLIP_PER_SIDE)
-
-    equity = float(start_equity)
-    closed = 0
-    open_ = 0
-
-    for _, r in df.iterrows():
-        entry = float(r.get("call_price") or 0.0)
-        status = str(r.get("status") or "OPEN")
-
-        lastp_val = r.get("last_price")
-        lastp = float(lastp_val) if lastp_val is not None else entry
-
-        if status == "TP":
-            exitp = float(r.get("tp_price") or lastp or entry)
-            closed += 1
-        elif status == "SL":
-            exitp = float(r.get("sl_price") or lastp or entry)
-            closed += 1
-        elif status == "EXPIRED":
-            exitp = lastp
-            closed += 1
-        else:
-            exitp = lastp
-            open_ += 1
-
-        if entry <= 0:
-            continue
-
-        ret = (exitp / entry) - 1.0
-        ret -= friction_rt
-        equity += float(notional_per_trade) * ret
-
-    pnl = equity - float(start_equity)
-    return {
-        "equity": equity,
-        "pnl": pnl,
-        "pnl_pct": (pnl / float(start_equity)) * 100.0,
-        "open_count": open_,
-        "closed_count": closed
-    }
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        # Report fatal startup error to heartbeat if possible
+        try:
+            sb = supabase_client_env()
+            sb.table("worker_heartbeat").upsert(
+                {
+                    "name": HEARTBEAT_NAME,
+                    "last_seen": datetime.now(timezone.utc).isoformat(),
+                    "note": f"{WORKER_VERSION} | FATAL STARTUP: {type(e).__name__}: {str(e)[:180]}",
+                },
+                on_conflict="name",
+            ).execute()
+        except Exception:
+            pass
+        raise
