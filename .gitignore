@@ -1,2 +1,31 @@
-.streamlit/secrets.toml
+# ======================
+# Python virtual envs
+# ======================
+.venv/
+venv/
+
+# ======================
+# Secrets / credentials
+# ======================
 .env
+.streamlit/secrets.toml
+
+# ======================
+# Python cache
+# ======================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ======================
+# Streamlit
+# ======================
+.streamlit/
+
+# ======================
+# OS / editor
+# ======================
+.DS_Store
+.vscode/
+.idea/
