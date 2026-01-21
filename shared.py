@@ -115,16 +115,19 @@ def db_update_call(sb: Client, coin: str, call_time: pd.Timestamp, status: str, 
 # HL client (rate-limited)
 # =========================
 SESSION = requests.Session()
+
 _last_call_ts = 0.0
-REQUEST_MIN_DELAY = 0.30
-MAX_RETRIES = 6
+# Lower RPS to avoid HL 429s
+REQUEST_MIN_DELAY = float(os.getenv("HL_MIN_DELAY_SECONDS", "0.75"))
+# Fail faster per coin to avoid eating the whole loop
+MAX_RETRIES = int(os.getenv("HL_MAX_RETRIES", "3"))
 
 def hl_post(payload: Dict[str, Any]) -> Any:
     """
     HL POST with:
     - rate limiting
     - retry/backoff
-    - DEBUG info on failures (status, snippet)
+    - debug info on failures (status, snippet)
     """
     global _last_call_ts
     now = time.time()
@@ -132,14 +135,13 @@ def hl_post(payload: Dict[str, Any]) -> Any:
     if wait > 0:
         time.sleep(wait)
 
-    backoff = 0.7
+    backoff = 1.2
     last_err = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = SESSION.post(HL_INFO_URL, json=payload, timeout=20)
 
-            # store info for debug
             status = r.status_code
             text_snip = ""
             try:
@@ -150,13 +152,13 @@ def hl_post(payload: Dict[str, Any]) -> Any:
             if status == 429:
                 last_err = f"HTTP 429 rate-limited. snip={text_snip}"
                 time.sleep(backoff + random.uniform(0, 0.4))
-                backoff = min(backoff * 1.7, 10.0)
+                backoff = min(backoff * 1.7, 12.0)
                 continue
 
             if status in (500, 502, 503, 504):
                 last_err = f"HTTP {status} server error. snip={text_snip}"
                 time.sleep(backoff + random.uniform(0, 0.4))
-                backoff = min(backoff * 1.7, 10.0)
+                backoff = min(backoff * 1.7, 12.0)
                 continue
 
             r.raise_for_status()
@@ -166,15 +168,14 @@ def hl_post(payload: Dict[str, Any]) -> Any:
         except requests.Timeout:
             last_err = "Timeout"
             time.sleep(backoff + random.uniform(0, 0.4))
-            backoff = min(backoff * 1.7, 10.0)
+            backoff = min(backoff * 1.7, 12.0)
 
         except requests.RequestException as e:
             last_err = f"RequestException: {type(e).__name__}: {str(e)[:140]}"
             time.sleep(backoff + random.uniform(0, 0.4))
-            backoff = min(backoff * 1.7, 10.0)
+            backoff = min(backoff * 1.7, 12.0)
 
     raise RuntimeError(f"HL request failed after retries. last_err={last_err}")
-
 
 def fetch_hl_universe() -> List[str]:
     meta = hl_post({"type": "meta"})
