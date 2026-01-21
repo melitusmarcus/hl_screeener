@@ -5,7 +5,7 @@ import requests
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 from supabase import create_client, Client
 
@@ -43,25 +43,6 @@ def supabase_client_env() -> Client:
         raise RuntimeError("Missing SUPABASE_URL / SUPABASE_SERVICE_KEY env vars.")
     return create_client(url, key)
 
-def safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        if x is None:
-            return float(default)
-        if isinstance(x, str) and x.strip() == "":
-            return float(default)
-        return float(x)
-    except Exception:
-        return float(default)
-
-def iso(dt: Any) -> str:
-    if isinstance(dt, pd.Timestamp):
-        dt = dt.to_pydatetime()
-    if isinstance(dt, datetime):
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.isoformat()
-    return str(dt)
-
 def db_upsert_calls(sb: Client, rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
@@ -69,21 +50,21 @@ def db_upsert_calls(sb: Client, rows: List[Dict[str, Any]]) -> int:
     payload = []
     for r in rows:
         payload.append({
-            "call_time": iso(r["call_time"]),
-            "detected_time": iso(r["detected_time"]),
+            "call_time": pd.to_datetime(r["call_time"], utc=True).isoformat(),
+            "detected_time": pd.to_datetime(r["detected_time"], utc=True).isoformat(),
             "coin": str(r["coin"]),
-            "call_price": safe_float(r["call_price"]),
-            "tp_price": safe_float(r["tp_price"]),
-            "sl_price": safe_float(r["sl_price"]),
-            "expiry_time": iso(r["expiry_time"]),
-            "dump_pct": safe_float(r["dump_pct"]),
-            "vol_z": safe_float(r["vol_z"]),
-            "vol_ratio": safe_float(r["vol_ratio"]),
-            "liq_ratio": safe_float(r["liq_ratio"]),
-            "chance_pct": safe_float(r["chance_pct"]),
-            "status": str(r.get("status", "OPEN")),
-            "last_price": safe_float(r.get("last_price", r["call_price"])),
-            "pnl_pct": safe_float(r.get("pnl_pct", 0.0)),
+            "call_price": float(r["call_price"]),
+            "tp_price": float(r["tp_price"]),
+            "sl_price": float(r["sl_price"]),
+            "expiry_time": pd.to_datetime(r["expiry_time"], utc=True).isoformat(),
+            "dump_pct": float(r["dump_pct"]),
+            "vol_z": float(r["vol_z"]),
+            "vol_ratio": float(r["vol_ratio"]),
+            "liq_ratio": float(r["liq_ratio"]),
+            "chance_pct": float(r["chance_pct"]),
+            "status": str(r["status"]),
+            "last_price": float(r["last_price"]),
+            "pnl_pct": float(r["pnl_pct"]),
         })
 
     sb.table("calls").upsert(payload, on_conflict="coin,call_time").execute()
@@ -107,57 +88,40 @@ def db_read_calls(sb: Client, limit: int = 5000) -> pd.DataFrame:
 def db_update_call(sb: Client, coin: str, call_time: pd.Timestamp, status: str, last_price: float, pnl_pct: float):
     sb.table("calls").update({
         "status": str(status),
-        "last_price": safe_float(last_price),
-        "pnl_pct": safe_float(pnl_pct),
-    }).eq("coin", str(coin)).eq("call_time", call_time.isoformat()).execute()
+        "last_price": float(last_price),
+        "pnl_pct": float(pnl_pct),
+    }).eq("coin", str(coin)).eq("call_time", pd.to_datetime(call_time, utc=True).isoformat()).execute()
 
 # =========================
 # HL client (rate-limited)
 # =========================
 SESSION = requests.Session()
-
 _last_call_ts = 0.0
-# Lower RPS to avoid HL 429s
-REQUEST_MIN_DELAY = float(os.getenv("HL_MIN_DELAY_SECONDS", "0.75"))
-# Fail faster per coin to avoid eating the whole loop
-MAX_RETRIES = int(os.getenv("HL_MAX_RETRIES", "3"))
+REQUEST_MIN_DELAY = 0.25  # lite snällare mot HL
+MAX_RETRIES = 10
 
 def hl_post(payload: Dict[str, Any]) -> Any:
-    """
-    HL POST with:
-    - rate limiting
-    - retry/backoff
-    - debug info on failures (status, snippet)
-    """
     global _last_call_ts
     now = time.time()
     wait = REQUEST_MIN_DELAY - (now - _last_call_ts)
     if wait > 0:
         time.sleep(wait)
 
-    backoff = 1.2
+    backoff = 0.7
     last_err = None
-
-    for attempt in range(1, MAX_RETRIES + 1):
+    for _ in range(MAX_RETRIES):
         try:
             r = SESSION.post(HL_INFO_URL, json=payload, timeout=20)
 
-            status = r.status_code
-            text_snip = ""
-            try:
-                text_snip = (r.text or "")[:180]
-            except Exception:
-                pass
-
-            if status == 429:
-                last_err = f"HTTP 429 rate-limited. snip={text_snip}"
-                time.sleep(backoff + random.uniform(0, 0.4))
+            if r.status_code == 429:
+                last_err = "HTTP 429 rate-limited"
+                time.sleep(backoff + random.uniform(0, 0.5))
                 backoff = min(backoff * 1.7, 12.0)
                 continue
 
-            if status in (500, 502, 503, 504):
-                last_err = f"HTTP {status} server error. snip={text_snip}"
-                time.sleep(backoff + random.uniform(0, 0.4))
+            if r.status_code in (500, 502, 503, 504):
+                last_err = f"HTTP {r.status_code} server error"
+                time.sleep(backoff + random.uniform(0, 0.5))
                 backoff = min(backoff * 1.7, 12.0)
                 continue
 
@@ -165,30 +129,28 @@ def hl_post(payload: Dict[str, Any]) -> Any:
             _last_call_ts = time.time()
             return r.json()
 
-        except requests.Timeout:
-            last_err = "Timeout"
-            time.sleep(backoff + random.uniform(0, 0.4))
-            backoff = min(backoff * 1.7, 12.0)
-
         except requests.RequestException as e:
-            last_err = f"RequestException: {type(e).__name__}: {str(e)[:140]}"
-            time.sleep(backoff + random.uniform(0, 0.4))
+            last_err = str(e)
+            time.sleep(backoff + random.uniform(0, 0.5))
             backoff = min(backoff * 1.7, 12.0)
 
     raise RuntimeError(f"HL request failed after retries. last_err={last_err}")
 
 def fetch_hl_universe() -> List[str]:
-    meta = hl_post({"type": "meta"})
-    coins: List[str] = []
-    if isinstance(meta, dict):
-        uni = meta.get("universe")
-        if isinstance(uni, list):
-            for item in uni:
-                if isinstance(item, dict):
-                    name = item.get("name")
-                    if isinstance(name, str) and name:
-                        coins.append(name)
-    return sorted(list(set(coins)))
+    try:
+        meta = hl_post({"type": "meta"})
+        coins: List[str] = []
+        if isinstance(meta, dict):
+            uni = meta.get("universe")
+            if isinstance(uni, list):
+                for item in uni:
+                    if isinstance(item, dict):
+                        name = item.get("name")
+                        if isinstance(name, str) and name:
+                            coins.append(name)
+        return sorted(list(set(coins)))
+    except Exception:
+        return []
 
 def to_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
@@ -199,17 +161,17 @@ def fetch_candles(coin: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         "req": {"coin": coin, "interval": INTERVAL, "startTime": start_ms, "endTime": end_ms}
     })
     if not data:
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
 
     df = pd.DataFrame(data)
     if "t" not in df.columns:
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
 
     df["timestamp"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    for src, dst in [("o", "open"), ("h", "high"), ("l", "low"), ("c", "close"), ("v", "volume")]:
+    for src, dst in [("o","open"),("h","high"),("l","low"),("c","close"),("v","volume")]:
         df[dst] = pd.to_numeric(df.get(src), errors="coerce")
 
-    df = df[["timestamp", "open", "high", "low", "close", "volume"]].dropna()
+    df = df[["timestamp","open","high","low","close","volume"]].dropna()
     df = df.sort_values("timestamp").drop_duplicates("timestamp")
     return df
 
@@ -243,7 +205,7 @@ def build_macro_series(end: datetime) -> pd.DataFrame:
     start = end - timedelta(days=3)
     btc = fetch_candles("BTC", to_ms(start), to_ms(end))
     if btc.empty or len(btc) < 120:
-        return pd.DataFrame(columns=["timestamp", "vol_z"])
+        return pd.DataFrame(columns=["timestamp","vol_z"])
 
     ret = np.log(btc["close"]).diff()
     rv = ret.rolling(40).std(ddof=0)
@@ -253,44 +215,90 @@ def build_macro_series(end: datetime) -> pd.DataFrame:
     out = pd.DataFrame({"timestamp": btc["timestamp"], "vol_z": vol_z}).dropna()
     return out
 
-def detect_call_for_coin(
+# =========================
+# NEW: One-pass scan analyzer
+# =========================
+def analyze_coin_for_scan(
     coin: str,
     macro: pd.DataFrame,
     base_wr: float,
     end: datetime,
-    detected_time: datetime
-) -> Optional[Dict[str, Any]]:
+    detected_time: Optional[datetime] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Returns (scan_snapshot_row, call_row_or_None)
+    Does ONE candleSnapshot for coin and reuses data for both snapshot + signal.
+    """
+    if detected_time is None:
+        detected_time = end
+
     start = end - timedelta(days=3)
     df = fetch_candles(coin, to_ms(start), to_ms(end))
     if df.empty or len(df) < (VOL_WIN + 5):
-        return None
+        return None, None
 
     m = pd.merge(df, macro, on="timestamp", how="inner").dropna()
     if m.empty or len(m) < (VOL_WIN + 5):
-        return None
+        return None, None
 
     m = m.reset_index(drop=True)
-    last = m.iloc[-1]
 
-    dump_pct = float((last["open"] - last["low"]) / last["open"])
-    vol_z = float(last["vol_z"])
+    # need at least 2 bars for 15m change%
+    if len(m) < 2:
+        return None, None
+
+    last = m.iloc[-1]
+    prev = m.iloc[-2]
+
+    # --- snapshot fields ---
+    last_open = float(last["open"])
+    last_low = float(last["low"])
+    last_close = float(last["close"])
+    prev_close = float(prev["close"]) if float(prev["close"]) != 0 else last_close
+
+    bar_time = pd.to_datetime(last["timestamp"], utc=True).to_pydatetime()
+    change_15m_pct = (last_close / prev_close - 1.0) * 100.0
+
+    dump_pct = 0.0
+    if last_open > 0:
+        dump_pct = float((last_open - last_low) / last_open)  # as fraction
 
     medv = m["volume"].rolling(VOL_WIN).median().iloc[-1]
     if not np.isfinite(medv) or medv <= 0:
-        return None
+        return None, None
 
     vol_ratio = float(last["volume"] / medv)
-    liq_ratio = float(last["volume"] / medv)
+    liq_ratio = float(last["volume"] / medv)  # placeholder (same as before)
+    btc_vol_z = float(last["vol_z"])
 
-    dump_ok = (dump_pct >= DROP_MIN) and (dump_pct <= DROP_MAX)
-    macro_ok = (abs(vol_z) <= VOL_Z_MAX)
-    spike_ok = (vol_ratio >= VOL_SPIKE_MULT)
-    floor_ok = (liq_ratio >= VOL_FLOOR_MULT)
+    gate_dump_ok = (dump_pct >= DROP_MIN) and (dump_pct <= DROP_MAX)
+    gate_macro_ok = (abs(btc_vol_z) <= VOL_Z_MAX)
+    gate_spike_ok = (vol_ratio >= VOL_SPIKE_MULT)
+    gate_floor_ok = (liq_ratio >= VOL_FLOOR_MULT)
+    signal_ok = bool(gate_dump_ok and gate_macro_ok and gate_spike_ok and gate_floor_ok)
 
-    if not (dump_ok and macro_ok and spike_ok and floor_ok):
-        return None
+    snapshot = {
+        "coin": str(coin),
+        "bar_time": pd.Timestamp(bar_time, tz=timezone.utc).isoformat(),
+        "updated_time": pd.Timestamp(end, tz=timezone.utc).isoformat(),
+        "close_price": float(last_close),
+        "change_15m_pct": float(change_15m_pct),
+        "dump_pct": float(dump_pct * 100.0),
+        "vol_ratio": float(vol_ratio),
+        "liq_ratio": float(liq_ratio),
+        "btc_vol_z": float(btc_vol_z),
+        "gate_dump_ok": bool(gate_dump_ok),
+        "gate_macro_ok": bool(gate_macro_ok),
+        "gate_spike_ok": bool(gate_spike_ok),
+        "gate_floor_ok": bool(gate_floor_ok),
+        "signal_ok": bool(signal_ok),
+    }
 
-    call_price = float(last["close"])
+    # --- signal row (calls) ---
+    if not signal_ok:
+        return snapshot, None
+
+    call_price = float(last_close)
     call_time = pd.to_datetime(last["timestamp"], utc=True).to_pydatetime()
     tp_price = call_price * (1 + TP)
     sl_price = call_price * (1 - SL)
@@ -299,12 +307,12 @@ def detect_call_for_coin(
     chance_pct = compute_chance_pct(
         base_wr=float(base_wr),
         dump_pct=float(dump_pct),
-        vol_z=float(vol_z),
+        vol_z=float(btc_vol_z),
         vol_ratio=float(vol_ratio),
         liq_ratio=float(liq_ratio),
     )
 
-    return {
+    call = {
         "call_time": pd.Timestamp(call_time, tz=timezone.utc),
         "detected_time": pd.Timestamp(detected_time, tz=timezone.utc),
         "coin": coin,
@@ -312,16 +320,21 @@ def detect_call_for_coin(
         "tp_price": tp_price,
         "sl_price": sl_price,
         "expiry_time": pd.Timestamp(expiry_time, tz=timezone.utc),
-        "dump_pct": dump_pct * 100.0,
-        "vol_z": vol_z,
-        "vol_ratio": vol_ratio,
-        "liq_ratio": liq_ratio,
-        "chance_pct": chance_pct,
+        "dump_pct": float(dump_pct * 100.0),
+        "vol_z": float(btc_vol_z),
+        "vol_ratio": float(vol_ratio),
+        "liq_ratio": float(liq_ratio),
+        "chance_pct": float(chance_pct),
         "status": "OPEN",
         "last_price": call_price,
         "pnl_pct": 0.0,
     }
 
+    return snapshot, call
+
+# =========================
+# Existing status update + sim
+# =========================
 def update_call_status(call_row: pd.Series, end: datetime) -> Dict[str, Any]:
     coin = str(call_row["coin"])
     call_time = pd.to_datetime(call_row["call_time"], utc=True)
@@ -335,25 +348,24 @@ def update_call_status(call_row: pd.Series, end: datetime) -> Dict[str, Any]:
     if df.empty:
         return dict(call_row)
 
-    tp_price = safe_float(call_row.get("tp_price"))
-    sl_price = safe_float(call_row.get("sl_price"))
-    call_price = safe_float(call_row.get("call_price"))
-    expiry_time = pd.to_datetime(call_row.get("expiry_time"), utc=True, errors="coerce")
+    tp_price = float(call_row["tp_price"])
+    sl_price = float(call_row["sl_price"])
+    call_price = float(call_row["call_price"])
+    expiry_time = pd.to_datetime(call_row["expiry_time"], utc=True)
 
-    hit_tp = (df["high"] >= tp_price).any() if tp_price > 0 else False
-    hit_sl = (df["low"] <= sl_price).any() if sl_price > 0 else False
+    hit_tp = (df["high"] >= tp_price).any()
+    hit_sl = (df["low"] <= sl_price).any()
 
-    status = str(call_row.get("status", "OPEN"))
+    status = "OPEN"
     if hit_sl:
         status = "SL"
     elif hit_tp:
         status = "TP"
-    elif isinstance(expiry_time, pd.Timestamp) and pd.notna(expiry_time):
-        if datetime.now(timezone.utc) >= expiry_time.to_pydatetime():
-            status = "EXPIRED"
+    elif datetime.now(timezone.utc) >= expiry_time.to_pydatetime():
+        status = "EXPIRED"
 
-    last_price = safe_float(df["close"].iloc[-1], default=call_price)
-    pnl_pct = ((last_price / call_price) - 1.0) * 100.0 if call_price > 0 else 0.0
+    last_price = float(df["close"].iloc[-1])
+    pnl_pct = (last_price / call_price - 1.0) * 100.0
 
     updated = dict(call_row)
     updated["status"] = status
@@ -366,47 +378,40 @@ def simulate_pnl(calls: pd.DataFrame, start_equity: float, notional_per_trade: f
         return {"equity": start_equity, "pnl": 0.0, "pnl_pct": 0.0, "open_count": 0, "closed_count": 0}
 
     df = calls.copy()
-    df["call_time"] = pd.to_datetime(df["call_time"], utc=True, errors="coerce")
-    df = df.dropna(subset=["call_time"]).sort_values("call_time")
+    df["call_time"] = pd.to_datetime(df["call_time"], utc=True)
+    df = df.sort_values("call_time")
 
     friction_rt = 0.0
     if apply_friction:
         friction_rt = 2.0 * (FEE_PER_SIDE + SLIP_PER_SIDE)
 
-    equity = float(start_equity)
+    equity = start_equity
     closed = 0
     open_ = 0
 
     for _, r in df.iterrows():
-        entry = safe_float(r.get("call_price"), default=0.0)
-        if entry <= 0:
-            continue
-
-        lastp = safe_float(r.get("last_price"), default=entry)
-        status = str(r.get("status", "OPEN"))
+        entry = float(r["call_price"])
+        lastp = float(r["last_price"]) if pd.notna(r.get("last_price")) else entry
+        status = str(r["status"])
 
         if status == "TP":
-            exitp = safe_float(r.get("tp_price"), default=lastp)
-            closed += 1
+            exitp = float(r["tp_price"]); closed += 1
         elif status == "SL":
-            exitp = safe_float(r.get("sl_price"), default=lastp)
-            closed += 1
+            exitp = float(r["sl_price"]); closed += 1
         elif status == "EXPIRED":
-            exitp = lastp
-            closed += 1
+            exitp = lastp; closed += 1
         else:
-            exitp = lastp
-            open_ += 1
+            exitp = lastp; open_ += 1
 
         ret = (exitp / entry) - 1.0
         ret -= friction_rt
-        equity += float(notional_per_trade) * ret
+        equity += notional_per_trade * ret
 
-    pnl = equity - float(start_equity)
+    pnl = equity - start_equity
     return {
         "equity": equity,
         "pnl": pnl,
-        "pnl_pct": (pnl / float(start_equity)) * 100.0 if start_equity else 0.0,
+        "pnl_pct": (pnl / start_equity) * 100.0,
         "open_count": open_,
         "closed_count": closed
     }

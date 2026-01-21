@@ -6,9 +6,9 @@ from supabase import create_client, Client
 
 from shared import simulate_pnl, TP, SL, HOLD_BARS, INTERVAL
 
-REFRESH_SECONDS = 60
+REFRESH_SECONDS = 30
 MAX_CALLS_DISPLAY = 30
-MAX_SCAN_DISPLAY = 200  # show up to N coins in latest scan list
+MAX_SCAN_DISPLAY = 250
 
 st.set_page_config(page_title="HL Whale-Dump Bounce Scanner", layout="wide")
 
@@ -103,13 +103,8 @@ def db_read_heartbeat(name: str = "scanner") -> pd.DataFrame:
     data = getattr(res, "data", None) or []
     return pd.DataFrame(data)
 
-def db_read_scan_latest(limit: int = 200) -> pd.DataFrame:
-    """
-    Reads latest scan snapshots, one row per coin per bar.
-    We show the latest bar_time only.
-    """
+def db_read_scan_latest(limit: int = 250) -> pd.DataFrame:
     sb = supabase_client()
-    # Get latest bar_time first
     r1 = sb.table("scan_snapshots").select("bar_time").order("bar_time", desc=True).limit(1).execute()
     d1 = getattr(r1, "data", None) or []
     if not d1:
@@ -134,14 +129,23 @@ def db_read_scan_latest(limit: int = 200) -> pd.DataFrame:
     df["updated_time"] = pd.to_datetime(df["updated_time"], utc=True, errors="coerce")
     return df
 
+# ---- Auto refresh (component if available, else meta refresh)
+def ui_autorefresh(seconds: int):
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=seconds * 1000, key="ui_refresh")
+    except Exception:
+        # fallback (full page refresh)
+        st.markdown(f"<meta http-equiv='refresh' content='{int(seconds)}'>", unsafe_allow_html=True)
+
+ui_autorefresh(REFRESH_SECONDS)
+
 # ---------- Header ----------
 hb = db_read_heartbeat("scanner")
 hb_since = "-"
-hb_note = ""
 if not hb.empty:
     hb_dt = pd.to_datetime(hb.loc[0, "last_seen"], utc=True, errors="coerce")
     hb_since = human_age(hb_dt)
-    hb_note = str(hb.loc[0, "note"] or "")
 
 st.markdown(
     f"""
@@ -161,17 +165,6 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# ---------- Top actions ----------
-left, right = st.columns([1, 2])
-with left:
-    if st.button("Export calls (CSV)"):
-        calls_df = db_read_calls(limit=200000)
-        if calls_df.empty:
-            st.warning("No calls.")
-        else:
-            csv = calls_df.sort_values("detected_time", ascending=True).to_csv(index=False).encode("utf-8")
-            st.download_button("Download", data=csv, file_name="calls_export.csv", mime="text/csv")
-
 # ---------- PnL ----------
 calls_all = db_read_calls(limit=200000)
 
@@ -180,12 +173,7 @@ st.subheader("PnL since start")
 if calls_all.empty:
     st.info("No calls.")
 else:
-    sim = simulate_pnl(
-        calls=calls_all,
-        start_equity=100_000.0,
-        notional_per_trade=2_000.0,
-        apply_friction=True
-    )
+    sim = simulate_pnl(calls=calls_all, start_equity=100_000.0, notional_per_trade=2_000.0, apply_friction=True)
     pnl = sim["pnl"]
     pnl_pct = sim["pnl_pct"]
     eq = sim["equity"]
@@ -217,26 +205,53 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------- Latest Scan ----------
 scan_df = db_read_scan_latest(limit=MAX_SCAN_DISPLAY)
-latest_scan_age = "-"
+
+latest_bar_age = "-"
+latest_bar_time_str = "-"
 if not scan_df.empty:
-    # use updated_time max as "latest"
-    latest_upd = scan_df["updated_time"].max()
-    latest_scan_age = human_age(latest_upd)
+    latest_bar_time = scan_df["bar_time"].max()
+    latest_bar_age = human_age(latest_bar_time)
+    latest_bar_time_str = latest_bar_time.strftime("%Y-%m-%d %H:%M:%S")
 
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.subheader(f"Latest scan • {latest_scan_age}")
+st.subheader(f"Latest scan • {latest_bar_age}")
 
 if scan_df.empty:
     st.info("No scan data yet.")
 else:
     view = scan_df.copy()
-    view["Since"] = view["updated_time"].apply(human_age)
-    view["Price"] = view["close_price"].map(lambda x: f"{float(x):.6g}")
-    view["15m %"] = view["change_15m_pct"].map(lambda x: f"{float(x):+.2f}%")
 
-    out = view[["coin", "Price", "15m %", "updated_time", "Since"]].copy()
-    out.rename(columns={"coin": "Coin", "updated_time": "Updated (UTC)"}, inplace=True)
-    st.dataframe(out, use_container_width=True, height=520)
+    # IMPORTANT: Since = bar close age (not updated_time)
+    view["Since"] = view["bar_time"].apply(human_age)
+
+    def dot(v: bool) -> str:
+        return "🟢" if bool(v) else "🔴"
+
+    view["Signal"] = view["signal_ok"].apply(dot)
+    view["Dump"] = view["gate_dump_ok"].apply(dot)
+    view["Macro"] = view["gate_macro_ok"].apply(dot)
+    view["Spike"] = view["gate_spike_ok"].apply(dot)
+    view["Floor"] = view["gate_floor_ok"].apply(dot)
+
+    view["Price"] = view["close_price"].map(lambda x: f"{float(x):.6g}" if pd.notna(x) else "-")
+    view["15m %"] = view["change_15m_pct"].map(lambda x: f"{float(x):+.2f}%" if pd.notna(x) else "-")
+    view["Dump %"] = view["dump_pct"].map(lambda x: f"{float(x):.2f}%" if pd.notna(x) else "-")
+    view["Vol x"] = view["vol_ratio"].map(lambda x: f"{float(x):.2f}x" if pd.notna(x) else "-")
+    view["BTC z"] = view["btc_vol_z"].map(lambda x: f"{float(x):+.2f}" if pd.notna(x) else "-")
+
+    out = view[[
+        "coin", "Price", "15m %", "Dump %", "Vol x", "BTC z",
+        "Signal", "Dump", "Macro", "Spike", "Floor",
+        "Since", "bar_time"
+    ]].copy()
+
+    out.rename(columns={
+        "coin": "Coin",
+        "bar_time": "Bar close (UTC)"
+    }, inplace=True)
+
+    st.dataframe(out, use_container_width=True, height=560)
+
 st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------- Recent Calls ----------
@@ -259,8 +274,8 @@ else:
     view["Status"] = view["status"].apply(status_tag)
     view["Chance"] = view["chance_pct"].map(lambda x: f"{float(x):.0f}%")
     view["Call"] = view["call_price"].map(lambda x: f"{float(x):.6g}")
-    view["Now"] = view["last_price"].map(lambda x: f"{float(x):.6g}")
-    view["Pnl %"] = view["pnl_pct"].map(lambda x: f"{float(x):+.2f}%")
+    view["Now"] = view["last_price"].map(lambda x: f"{float(x):.6g}" if pd.notna(x) else "-")
+    view["Pnl %"] = view["pnl_pct"].map(lambda x: f"{float(x):+.2f}%" if pd.notna(x) else "-")
     view["Dump %"] = view["dump_pct"].map(lambda x: f"{float(x):.2f}%")
 
     out = view[["detected_time", "Since", "call_time", "coin", "Status", "Chance", "Call", "Now", "Pnl %", "Dump %"]].copy()
@@ -273,7 +288,3 @@ else:
     st.dataframe(out, use_container_width=True, height=540)
 
 st.markdown("</div>", unsafe_allow_html=True)
-
-# Auto refresh (no extra component)
-st.markdown(f"<div class='small muted'>Auto-refresh: {REFRESH_SECONDS}s</div>", unsafe_allow_html=True)
-st.experimental_rerun if False else None
