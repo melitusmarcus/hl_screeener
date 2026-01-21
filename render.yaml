@@ -2,6 +2,7 @@ services:
   - type: web
     name: hl-screener-ui
     env: python
+    runtime: python-3.11.9
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
@@ -14,6 +15,7 @@ services:
   - type: worker
     name: hl-screener-worker
     env: python
+    runtime: python-3.11.9
     plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python worker.py
