@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import time
 import random
@@ -390,3 +391,68 @@ def db_update_call(sb: Client, coin: str, call_time: pd.Timestamp, status: str, 
         "last_price": float(last_price),
         "pnl_pct": float(pnl_pct),
     }).eq("coin", str(coin)).eq("call_time", as_utc_ts(call_time).isoformat()).execute()
+
+# =========================
+# PnL simulator (UI expects this)
+# =========================
+def simulate_pnl(
+    calls: pd.DataFrame,
+    start_equity: float,
+    notional_per_trade: float,
+    apply_friction: bool = True
+) -> Dict[str, Any]:
+    """
+    Used by Streamlit UI to show "PnL since start (sim)".
+    Works on calls df from db_read_calls().
+    """
+    if calls is None or calls.empty:
+        return {"equity": start_equity, "pnl": 0.0, "pnl_pct": 0.0, "open_count": 0, "closed_count": 0}
+
+    df = calls.copy()
+    df["call_time"] = pd.to_datetime(df["call_time"], utc=True, errors="coerce")
+    df = df.sort_values("call_time")
+
+    friction_rt = 0.0
+    if apply_friction:
+        friction_rt = 2.0 * (FEE_PER_SIDE + SLIP_PER_SIDE)
+
+    equity = float(start_equity)
+    closed = 0
+    open_ = 0
+
+    for _, r in df.iterrows():
+        entry = safe_float(r.get("call_price"))
+        lastp = safe_float(r.get("last_price"))
+        status = str(r.get("status", "OPEN"))
+
+        if not np.isfinite(entry) or entry <= 0:
+            continue
+
+        if status == "TP":
+            exitp = safe_float(r.get("tp_price"), default=lastp)
+            closed += 1
+        elif status == "SL":
+            exitp = safe_float(r.get("sl_price"), default=lastp)
+            closed += 1
+        elif status == "EXPIRED":
+            exitp = lastp
+            closed += 1
+        else:
+            exitp = lastp
+            open_ += 1
+
+        if not np.isfinite(exitp) or exitp <= 0:
+            continue
+
+        ret = (exitp / entry) - 1.0
+        ret -= friction_rt
+        equity += float(notional_per_trade) * float(ret)
+
+    pnl = equity - start_equity
+    return {
+        "equity": equity,
+        "pnl": pnl,
+        "pnl_pct": (pnl / start_equity) * 100.0,
+        "open_count": open_,
+        "closed_count": closed,
+    }
