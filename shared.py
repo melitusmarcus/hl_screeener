@@ -53,7 +53,6 @@ def to_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 def as_utc_ts(x) -> pd.Timestamp:
-    # robust UTC parse
     ts = pd.to_datetime(x, utc=True, errors="coerce")
     if isinstance(ts, pd.Timestamp) and ts.tzinfo is None:
         ts = ts.tz_localize(timezone.utc)
@@ -72,7 +71,7 @@ def safe_float(x, default=np.nan) -> float:
 # =========================
 SESSION = requests.Session()
 _last_call_ts = 0.0
-REQUEST_MIN_DELAY = float(os.getenv("HL_REQUEST_MIN_DELAY", "0.35"))  # slower to reduce 429
+REQUEST_MIN_DELAY = float(os.getenv("HL_REQUEST_MIN_DELAY", "0.35"))
 MAX_RETRIES = int(os.getenv("HL_MAX_RETRIES", "8"))
 
 def hl_post(payload: Dict[str, Any]) -> Any:
@@ -167,6 +166,29 @@ def build_macro_series(end: datetime) -> pd.DataFrame:
     sd = rv.rolling(40).std(ddof=0)
     vol_z = (rv - mu) / sd
     out = pd.DataFrame({"timestamp": btc["timestamp"], "vol_z": vol_z}).dropna()
+    out = out.sort_values("timestamp")
+    return out
+
+def attach_macro_asof(df: pd.DataFrame, macro: pd.DataFrame, tolerance_minutes: int = 20) -> pd.DataFrame:
+    """
+    Robust join: assign latest BTC vol_z at or before each coin candle timestamp.
+    Avoids exact timestamp mismatch => macro gate falsely fails.
+    """
+    if df.empty or macro.empty:
+        out = df.copy()
+        out["vol_z"] = np.nan
+        return out
+
+    left = df.sort_values("timestamp").copy()
+    right = macro.sort_values("timestamp").copy()
+
+    out = pd.merge_asof(
+        left,
+        right[["timestamp", "vol_z"]],
+        on="timestamp",
+        direction="backward",
+        tolerance=pd.Timedelta(minutes=tolerance_minutes),
+    )
     return out
 
 # =========================
@@ -201,12 +223,15 @@ def detect_call_for_coin(
     end: datetime,
     detected_time: datetime,
 ) -> Optional[Dict[str, Any]]:
+    if macro is None or macro.empty:
+        return None
+
     start = end - timedelta(days=3)
     df = fetch_candles(coin, to_ms(start), to_ms(end))
     if df.empty or len(df) < (VOL_WIN + 5):
         return None
 
-    m = pd.merge(df, macro, on="timestamp", how="inner").dropna()
+    m = attach_macro_asof(df, macro, tolerance_minutes=20).dropna(subset=["vol_z"])
     if m.empty or len(m) < (VOL_WIN + 5):
         return None
 
@@ -264,7 +289,7 @@ def detect_call_for_coin(
     }
 
 # =========================
-# Position status update (OPEN -> TP/SL/EXPIRED) + live last_price/pnl
+# Position status update
 # =========================
 def update_call_status(call_row: pd.Series, end: datetime) -> Dict[str, Any]:
     coin = str(call_row.get("coin"))
@@ -272,7 +297,6 @@ def update_call_status(call_row: pd.Series, end: datetime) -> Dict[str, Any]:
     if pd.isna(call_time):
         return dict(call_row)
 
-    # fetch from just before call_time to now
     start = call_time - pd.Timedelta(minutes=15)
     df = fetch_candles(coin, to_ms(start.to_pydatetime()), to_ms(end))
     if df.empty:
@@ -295,10 +319,8 @@ def update_call_status(call_row: pd.Series, end: datetime) -> Dict[str, Any]:
 
     status = str(call_row.get("status", "OPEN"))
     if status != "OPEN":
-        # already closed -> keep static (archived)
         return dict(call_row)
 
-    # conservative: SL first
     new_status = "OPEN"
     if hit_sl:
         new_status = "SL"
@@ -310,7 +332,6 @@ def update_call_status(call_row: pd.Series, end: datetime) -> Dict[str, Any]:
         new_status = "EXPIRED"
         last_price = float(df["close"].iloc[-1])
     else:
-        # still open: mark-to-market on last close
         last_price = float(df["close"].iloc[-1])
 
     pnl_pct = (last_price / call_price - 1.0) * 100.0
@@ -364,65 +385,8 @@ def db_read_calls(sb: Client, limit: int = 5000) -> pd.DataFrame:
     return df
 
 def db_update_call(sb: Client, coin: str, call_time: pd.Timestamp, status: str, last_price: float, pnl_pct: float):
-    # update exact position row
     sb.table("calls").update({
         "status": str(status),
         "last_price": float(last_price),
         "pnl_pct": float(pnl_pct),
     }).eq("coin", str(coin)).eq("call_time", as_utc_ts(call_time).isoformat()).execute()
-
-# =========================
-# PnL simulation
-# =========================
-def simulate_pnl(calls: pd.DataFrame, start_equity: float, notional_per_trade: float, apply_friction: bool) -> Dict[str, Any]:
-    if calls.empty:
-        return {"equity": start_equity, "pnl": 0.0, "pnl_pct": 0.0, "open_count": 0, "closed_count": 0}
-
-    df = calls.copy()
-    df["call_time"] = pd.to_datetime(df["call_time"], utc=True)
-    df = df.sort_values("call_time")
-
-    friction_rt = 0.0
-    if apply_friction:
-        friction_rt = 2.0 * (FEE_PER_SIDE + SLIP_PER_SIDE)
-
-    equity = start_equity
-    closed = 0
-    open_ = 0
-
-    for _, r in df.iterrows():
-        entry = safe_float(r.get("call_price"))
-        lastp = safe_float(r.get("last_price"))
-        status = str(r.get("status", "OPEN"))
-
-        if not np.isfinite(entry) or entry <= 0:
-            continue
-
-        if status == "TP":
-            exitp = safe_float(r.get("tp_price"), lastp)
-            closed += 1
-        elif status == "SL":
-            exitp = safe_float(r.get("sl_price"), lastp)
-            closed += 1
-        elif status == "EXPIRED":
-            exitp = lastp
-            closed += 1
-        else:
-            exitp = lastp
-            open_ += 1
-
-        if not np.isfinite(exitp) or exitp <= 0:
-            continue
-
-        ret = (exitp / entry) - 1.0
-        ret -= friction_rt
-        equity += notional_per_trade * ret
-
-    pnl = equity - start_equity
-    return {
-        "equity": equity,
-        "pnl": pnl,
-        "pnl_pct": (pnl / start_equity) * 100.0,
-        "open_count": open_,
-        "closed_count": closed
-    }
